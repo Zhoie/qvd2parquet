@@ -76,6 +76,7 @@ GitHub release.
 
 ```text
 qvd2parquet [options] input.qvd output.parquet
+qvd2parquet --inspect [options] input.qvd
 
   -columns name1,name2       Convert only these columns
   -exclude '%*,*_TMP'        Skip fields matching these wildcard patterns
@@ -83,7 +84,8 @@ qvd2parquet [options] input.qvd output.parquet
   -field-name '${name}'      Template for the new column name
   -field-comment '${comment}'  Template for the column comment
   -mixed error               Mixed-type strategy: error|string|promote|dual-columns
-  -dual numeric              Dual strategy: numeric|text|columns
+  -dual auto                 Dual strategy: auto|numeric|text|columns
+  -infer-dates               Read an untyped column as a date/timestamp when its text says so
   -numeric-promote decimal   Numeric widening: decimal | true (float64) | false
   -mixed-string-fallback     Convert otherwise-invalid mixed columns to string
   -decimal-source auto       Decimal extraction: auto|text|numeric
@@ -99,6 +101,7 @@ qvd2parquet [options] input.qvd output.parquet
   -quality-tolerance 1e-9    Relative tolerance for floating-point quality checks
   -quality-abs-tolerance 0   Absolute tolerance for floating-point quality checks
   -progress 1000000          Log every N rows, 0 disables progress
+  -inspect                   Read only the header and symbol tables, print the schema, and exit
   -force                     Overwrite an existing output file
   -strict                    Enable strict validation defaults
   -version                   Print the version and exit
@@ -113,7 +116,7 @@ pipelines and shell substitutions.
 
 ```text
 $ qvd2parquet --timezone UTC --quality-gate numeric sales.qvd sales.parquet
-qvd2parquet 0.3.0  (c) RALFORION d.o.o.
+qvd2parquet 0.3.1  (c) 2026, RALFORION d.o.o.
 qvd2parquet: sales.qvd: table "products", 77 rows, 7 bytes/record, 9 of 9 columns selected
 qvd2parquet: read 412 symbols in 1ms; records start at offset 8973
 qvd2parquet: schema: Einkaufspreis: REAL with 75 double symbols promoted to decimal(5,2); scale 2 inferred from values
@@ -132,7 +135,7 @@ Print the version and exit with `--version`:
 
 ```text
 $ qvd2parquet --version
-qvd2parquet 0.1.0  (c) RALFORION d.o.o.
+qvd2parquet 0.3.1  (c) 2026, RALFORION d.o.o.
 ```
 
 ### Examples
@@ -173,6 +176,67 @@ Verify the output with an external reader:
 duckdb -c "describe select * from read_parquet('sales.parquet')"
 duckdb -c "select count(*) as n from read_parquet('sales.parquet')"
 ```
+
+## Inspecting a file
+
+`--inspect` reads the XML header and the symbol tables, prints the schema a
+conversion would produce, and exits. It never touches the record area, so the
+cost is independent of row count — on a 29 MiB, 5-million-row file it reads
+7.9 KiB and finishes in 0.01s, against 1.58s for the full conversion.
+
+```sh
+qvd2parquet --inspect products.qvd
+```
+
+```text
+File            products.qvd
+Table           products
+Rows            77
+Record size     7 bytes
+Symbols read    412 in 2ms (3.2 KiB)
+Records skipped 539 B not read
+Fields          9 of 9 selected
+
+COLUMN           QVD TYPE  SYMBOLS  NULLS  PARQUET TYPE   NOTES
+Einkaufspreis    REAL      75       0      decimal(5, 2)  REAL with 75 double symbols promoted to decimal(5,2); scale 2 inferred from values
+KategorieNr      INTEGER   8        0      int64          INTEGER with 8 integer symbols, written as int64
+Produktname      UNKNOWN   77       0      utf8           77 text symbols, written as utf8
+Listenpreis      REAL      60       0      decimal(5, 2)  REAL with 25 integer and 35 double symbols promoted to decimal(5,2); scale 2 inferred from values
+```
+
+The report is written to **stdout**, so it can be piped; the banner and any
+diagnostics stay on stderr. All type policy flags apply, so what you see is what
+a conversion would write — including `--exclude` and `--field-regex`:
+
+```sh
+qvd2parquet --inspect \
+  --exclude '%*' \
+  --field-regex '^[^-]*-\|\|-(?P<name>[^-]*)-\|\|-(?P<comment>.*)$' \
+  A057.qvd
+```
+
+```text
+Fields          4 of 6 selected (2 excluded: %A057_PKEY, %SYS_TS)
+
+COLUMN                                    QVD TYPE  SYMBOLS  NULLS  PARQUET TYPE   NOTES
+DATBI (A057-||-DATBI-||-Ende Gültigkeit)  INTEGER   2        0      int64          Ende Gültigkeit
+KBETR (A057-||-KBETR-||-Betrag)           REAL      2        0      decimal(4, 2)  Betrag
+```
+
+When the type policy rejects a column, `--inspect` prints the reason and falls
+back to the raw symbol profiles that explain it, then exits `3`:
+
+```text
+Schema could not be resolved:
+  schema/type policy error: mixed type column "CustomerID": symbols contain 1 numeric values and 1 strings; use --mixed=string ...
+
+COLUMN      QVD TYPE  SYMBOLS  NULLS  INTS  FLOATS  STRINGS  DUALS
+CustomerID  ASCII     2        0      1     0       1        0
+```
+
+That makes it a cheap pre-flight check in a pipeline: inspect first, and only
+convert once the schema is what you expect. `--schema-report` works in inspect
+mode too, for the same information as JSON.
 
 ## Selecting and renaming fields
 
@@ -282,14 +346,77 @@ harmless, some are not:
 | `promote` | keep numerics numeric and pure text as text; still fail on number + text unless `--mixed-string-fallback` |
 | `dual-columns` | write the numeric side under the original name and the display side as `${name}__text` |
 
-`--dual` selects which side of a Qlik dual is written: `numeric` (default),
-`text`, or `columns` for both. `--mixed=dual-columns` implies `--dual=columns`.
+`--dual` selects which side of a Qlik dual is written:
+
+| Value | Behaviour |
+| --- | --- |
+| `auto` (default) | keep the display string only when it carries something the number does not |
+| `numeric` | write the numeric side only |
+| `text` | write the display string only |
+| `columns` | always write both |
+
+`--mixed=dual-columns` implies `--dual=columns`.
+
+### What `--dual=auto` considers redundant
+
+A Qlik dual pairs a number with a display string. Often that string is just the
+number formatted — `1.234,56` beside `1234.56`, or `11/20/2010` beside the
+Excel-style serial `40502`. Writing it would duplicate the numeric column, so
+`auto` drops it. When the string carries something else — `Open` beside `1`, or
+`unknown` beside `-1` — it is kept as `${name}__text` and the reason is stated:
+
+```text
+schema: Amount: MONEY, written as decimal(6,2); ...; all 3 display strings are formatted renderings of the numeric value, so no text column is written
+schema: Status: INTEGER with 3 integer symbols, written as int64; 3 of 3 display strings carry text the number does not (e.g. "Open" beside 1), so they are kept in "Status__text"
+```
+
+A single odd value is enough to keep the column: `auto` errs towards preserving
+data, and reports how many strings drove the decision.
+
+Whether a rendered date counts as redundant depends on the type it sits beside.
+`11/20/2010` next to a `date32` column adds nothing, but next to a bare
+`float64` serial it is the only human-readable form, so it is kept.
+
+### Identifying dates without a declared type
+
+Qlik writes semantic tags alongside each field. A field declaring no
+`NumberFormat/Type` but tagged `$date`, `$timestamp`, `$time` or `$interval` is
+resolved to that type:
+
+```text
+schema: OrderDate: DATE, written as date32 (days since epoch); no declared type, but tagged $date
+schema: Created: TIMESTAMP, written as timestamp[ms, tz=UTC]; no declared type, but tagged $timestamp
+```
+
+This is the most reliable signal, and the only one that works for a **plain
+numeric field carrying no display strings** — a bare Excel serial that no
+amount of text inspection could identify. A declared type still wins over a
+tag, since it is the more specific statement.
+
+### Inferring dates from display strings
+
+Older files carry no tags at all. `--infer-dates` (on by default) is the
+fallback: a column with no declared type is read as a date or timestamp when
+**every** display string renders its Excel-style serial value as one:
+
+```text
+schema: Date: TIMESTAMP, written as timestamp[ms, tz=UTC]; no declared type, but all 18 display strings render their value as a timestamp (e.g. "11/20/2010"), so it is read as one
+```
+
+The check is format-agnostic: it converts the serial to a date and requires
+every number in the string to be one of that date's components, with the day
+itself present. A neighbouring day is accepted, because the string was rendered
+in whatever timezone wrote the file and a whole-hour offset can move the
+calendar date — real QVDs contain exactly this. Serials outside roughly 1900 to
+2200 are never read as dates, blank display strings are not evidence, and a
+column mixing dates with anything else is left alone. Pass `--infer-dates=false`
+to disable it.
 
 Output column names must be unique. If a generated `${name}__text` column would
 collide with a real source column of that name, the conversion fails with a
 schema policy error rather than writing an ambiguous Parquet schema.
 
-The defaults — `--mixed=error --numeric-promote=decimal --dual=numeric
+The defaults — `--mixed=error --numeric-promote=decimal --dual=auto
 --mixed-string-fallback=false` — stop an ETL job on unexpected schema drift
 while still handling the common `int + float` and dual-numeric cases.
 

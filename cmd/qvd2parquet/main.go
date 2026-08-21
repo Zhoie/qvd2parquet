@@ -33,7 +33,7 @@ const (
 // -ldflags "-X main.version=..."; scripts/build-release.sh does this.
 const (
 	programName = "qvd2parquet"
-	copyright   = "(c) RALFORION d.o.o."
+	copyright   = "(c) 2026, RALFORION d.o.o."
 )
 
 // defaultVersion is what a plain "go build" reports. Release archives override
@@ -90,7 +90,8 @@ func run() int {
 		out := fs.Output()
 		fmt.Fprintf(out, "%s\n", banner())
 		fmt.Fprintf(out, "Convert Qlik QVD files to Parquet.\n\n")
-		fmt.Fprintf(out, "Usage:\n  qvd2parquet [options] input.qvd output.parquet\n\n")
+		fmt.Fprintf(out, "Usage:\n  qvd2parquet [options] input.qvd output.parquet\n")
+		fmt.Fprintf(out, "  qvd2parquet --inspect [options] input.qvd\n\n")
 		fmt.Fprintf(out, "Options:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(out, "\nExit codes:\n"+
@@ -111,7 +112,7 @@ func run() int {
 		fieldName     = fs.String("field-name", "", "Template for the new column name (default \"${name}\")")
 		fieldComment  = fs.String("field-comment", "", "Template for the column comment (default \"${comment}\")")
 		mixed         = fs.String("mixed", def.Mixed.String(), "Mixed-type strategy: error|string|promote|dual-columns")
-		dual          = fs.String("dual", def.Dual.String(), "Dual strategy: numeric|text|columns")
+		dual          = fs.String("dual", def.Dual.String(), "Dual strategy: auto|numeric|text|columns")
 		promote       = fs.String("numeric-promote", def.NumericPromote.String(), "Numeric widening: decimal (exact, scale inferred from values) | true (float64) | false")
 		strFallback   = fs.Bool("mixed-string-fallback", def.MixedStringFallback, "Convert otherwise-invalid mixed columns to string")
 		decSource     = fs.String("decimal-source", def.DecimalSource.String(), "Decimal extraction: auto|text|numeric")
@@ -129,6 +130,8 @@ func run() int {
 		progress      = fs.Int64("progress", def.ProgressEvery, "Log every N rows, 0 disables progress")
 		force         = fs.Bool("force", false, "Overwrite an existing output file")
 		strict        = fs.Bool("strict", false, "Enable strict validation defaults")
+		inferDates    = fs.Bool("infer-dates", def.InferDates, "Read an untyped column as a date/timestamp when its display strings render its serial value as one")
+		inspect       = fs.Bool("inspect", false, "Read only the header and symbol tables, print the schema, and exit")
 		showVersion   = fs.Bool("version", false, "Print the version and exit")
 	)
 
@@ -142,18 +145,32 @@ func run() int {
 		fmt.Println(banner())
 		return exitOK
 	}
-	if fs.NArg() != 2 {
-		fmt.Fprintf(os.Stderr, "%s: expected an input and an output path, got %d argument(s)\n\n",
-			programName, fs.NArg())
+	// --inspect never writes an output file, so it takes only an input path.
+	wantArgs := 2
+	if *inspect {
+		wantArgs = 1
+	}
+	if fs.NArg() != wantArgs {
+		what := "an input and an output path"
+		if *inspect {
+			what = "an input path"
+		}
+		fmt.Fprintf(os.Stderr, "%s: expected %s, got %d argument(s)\n\n",
+			programName, what, fs.NArg())
 		fs.Usage()
 		return exitUsage
 	}
-	inputPath, outputPath := fs.Arg(0), fs.Arg(1)
+	inputPath := fs.Arg(0)
+	var outputPath string
+	if !*inspect {
+		outputPath = fs.Arg(1)
+	}
 
 	var err error
 	opts := def
 	opts.MixedStringFallback = *strFallback
 	opts.DecimalStrict = *decStrict
+	opts.InferDates = *inferDates
 	opts.Compression = *compression
 	opts.BatchRows = *batchRows
 	opts.Workers = *workers
@@ -212,6 +229,10 @@ func run() int {
 
 	fmt.Fprintln(os.Stderr, banner())
 
+	if *inspect {
+		return runInspect(inputPath, &opts)
+	}
+
 	logf := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, programName+": "+format+"\n", args...)
 	}
@@ -225,6 +246,39 @@ func run() int {
 	logf("wrote %s: %d rows, %d columns, %s in %s (%.0f rows/s)",
 		outputPath, stats.Rows, stats.Columns, humanBytes(stats.OutputBytes),
 		stats.Elapsed.Round(1e6), stats.RowsPerSecond())
+	return exitOK
+}
+
+// runInspect reads the header and symbol tables only, then prints the schema a
+// conversion would produce. The report is the command's result, so it goes to
+// stdout; diagnostics stay on stderr.
+func runInspect(inputPath string, opts *convert.Options) int {
+	rep, err := convert.Inspect(inputPath, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
+		return exitCodeFor(err)
+	}
+	defer rep.Close()
+
+	if err := rep.Write(os.Stdout); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
+		return exitOutput
+	}
+	if opts.SchemaReportPath != "" {
+		if rep.Schema == nil {
+			fmt.Fprintf(os.Stderr, "%s: no schema to report: %v\n", programName, rep.SchemaErr)
+			return exitSchema
+		}
+		if err := convert.WriteSchemaReport(opts.SchemaReportPath, inputPath, rep.File, rep.Schema); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
+			return exitOutput
+		}
+		fmt.Fprintf(os.Stderr, "%s: wrote schema report to %s\n", programName, opts.SchemaReportPath)
+	}
+	// A file the type policy rejects exits non-zero, so scripts can gate on it.
+	if rep.SchemaErr != nil {
+		return exitCodeFor(rep.SchemaErr)
+	}
 	return exitOK
 }
 

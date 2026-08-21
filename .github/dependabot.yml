@@ -1,0 +1,48 @@
+version: 2
+
+updates:
+  # Go module dependencies. arrow-go is the only direct dependency, and it
+  # drives the minimum Go version, so its updates get reviewed rather than
+  # grouped away.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Zagreb
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+      - go
+    groups:
+      # Indirect dependencies churn often and are low risk together.
+      indirect:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "github.com/apache/arrow-go/*"
+        update-types:
+          - minor
+          - patch
+
+  # Workflow actions (checkout, setup-go).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Zagreb
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions:
+        patterns:
+          - "*"

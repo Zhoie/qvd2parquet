@@ -46,11 +46,13 @@ func TestRealQVDProducts(t *testing.T) {
 	for _, c := range report.Columns {
 		types[c.Name] = c.Type
 	}
+	// The default is --numeric-promote=decimal, so the two price columns
+	// resolve to exact decimals even though QlikView declares them REAL.
 	for name, want := range map[string]string{
-		"Einkaufspreis": "float64", // REAL
-		"KategorieNr":   "int64",   // INTEGER
-		"Produktname":   "utf8",    // text
-		"Listenpreis":   "float64", // int + double promoted
+		"Einkaufspreis": "decimal(5, 2)", // REAL, scale inferred from values
+		"KategorieNr":   "int64",         // INTEGER
+		"Produktname":   "utf8",          // text
+		"Listenpreis":   "decimal(5, 2)", // int + double, scale inferred
 	} {
 		if types[name] != want {
 			t.Errorf("column %q resolved to %q, want %q", name, types[name], want)
@@ -270,6 +272,7 @@ func TestRealQVDDecimalPromotion(t *testing.T) {
 	}
 
 	floatOpts := testOptions()
+	floatOpts.NumericPromote = PromoteFloat64
 	floatOpts.Quality = QualityNumeric
 	floatOut := filepath.Join(t.TempDir(), "float.parquet")
 	_, floatReport, err := Run(context.Background(), in, floatOut, &floatOpts, nil)

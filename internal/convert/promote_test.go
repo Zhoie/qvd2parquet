@@ -128,13 +128,33 @@ func TestPromoteDecimalDoesNotOverrideDeclaredMoney(t *testing.T) {
 	}
 }
 
-// The default is unchanged: float64, no decimal promotion.
-func TestDefaultPromotionIsStillFloat64(t *testing.T) {
+// Decimal promotion is the default, so a price column is exact out of the box.
+func TestDefaultPromotionIsDecimal(t *testing.T) {
 	f := qvdtest.Field{Name: "Price", Type: "REAL",
 		Symbols: []qvd.Symbol{qvdtest.Int(20), qvdtest.Float(7.75)}, Rows: []int{0, 1}}
 	rs := mustResolve(t, f, nil)
+	if got := rs.Columns[0].ArrowType.String(); got != "decimal(4, 2)" {
+		t.Errorf("default resolved to %s, want decimal(4, 2)", got)
+	}
+	if DefaultOptions().NumericPromote != PromoteDecimal {
+		t.Error("DefaultOptions should promote to decimal")
+	}
+}
+
+// By default a column with no representable scale silently falls back to
+// float64 rather than failing: the default is a preference, not a demand, and
+// float64 is what such a column would have resolved to anyway.
+func TestDefaultPromotionFallsBackToFloat64(t *testing.T) {
+	f := qvdtest.Field{Name: "Rate", Type: "REAL",
+		Symbols: []qvd.Symbol{qvdtest.Float(1.0 / 3), qvdtest.Float(2)}, Rows: []int{0, 1}}
+	rs := mustResolve(t, f, nil)
 	if got := rs.Columns[0].ArrowType.String(); got != "float64" {
-		t.Errorf("default resolved to %s, want float64", got)
+		t.Errorf("resolved to %s, want a float64 fallback", got)
+	}
+	// The schema report must still say what happened.
+	joined := strings.Join(rs.Notes, " ")
+	if !strings.Contains(joined, "float64") || !strings.Contains(joined, "no exact scale") {
+		t.Errorf("notes should explain the fallback: %q", joined)
 	}
 }
 
@@ -144,14 +164,17 @@ func TestPromoteDecimalFollowsDecimalStrict(t *testing.T) {
 	f := qvdtest.Field{Name: "Rate", Type: "REAL",
 		Symbols: []qvd.Symbol{qvdtest.Float(1.0 / 3), qvdtest.Float(2)}, Rows: []int{0, 1}}
 
+	// Only an explicit --numeric-promote=decimal is a demand strong enough to
+	// fail the conversion.
 	_, err := resolve(t, f, func(o *Options) {
 		o.NumericPromote = PromoteDecimal
+		o.NumericPromoteExplicit = true
 		o.DecimalStrict = true
 	})
 	if !errors.Is(err, ErrSchemaPolicy) {
 		t.Fatalf("strict mode err = %v, want ErrSchemaPolicy", err)
 	}
-	for _, want := range []string{"Rate", "--schema", "--decimal-strict=false"} {
+	for _, want := range []string{"Rate", "--schema", "--numeric-promote=true"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q should mention %q", err, want)
 		}
@@ -159,6 +182,7 @@ func TestPromoteDecimalFollowsDecimalStrict(t *testing.T) {
 
 	rs := mustResolve(t, f, func(o *Options) {
 		o.NumericPromote = PromoteDecimal
+		o.NumericPromoteExplicit = true
 		o.DecimalStrict = false
 	})
 	if got := rs.Columns[0].ArrowType.String(); got != "float64" {

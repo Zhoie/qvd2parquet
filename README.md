@@ -76,10 +76,10 @@ qvd2parquet [options] input.qvd output.parquet
   -columns name1,name2       Convert only these columns
   -mixed error               Mixed-type strategy: error|string|promote|dual-columns
   -dual numeric              Dual strategy: numeric|text|columns
-  -numeric-promote true      Numeric widening: true (float64) | false | decimal
+  -numeric-promote decimal   Numeric widening: decimal | true (float64) | false
   -mixed-string-fallback     Convert otherwise-invalid mixed columns to string
   -decimal-source auto       Decimal extraction: auto|text|numeric
-  -decimal-strict            Fail if exact decimal conversion cannot be proven (default true)
+  -decimal-strict            Fail instead of rounding when a value does not fit its scale
   -compression zstd          Parquet compression: zstd|snappy|gzip|uncompressed
   -batch-rows 65536          Rows per Arrow batch and Parquet row group
   -workers 0                 Decode workers, 0 means runtime.NumCPU()
@@ -155,6 +155,62 @@ duckdb -c "describe select * from read_parquet('sales.parquet')"
 duckdb -c "select count(*) as n from read_parquet('sales.parquet')"
 ```
 
+## Selecting and renaming fields
+
+`--columns` keeps only the named fields. `--exclude` drops fields matching
+shell-style wildcard patterns (`*` and `?`, case-insensitive), which is the
+usual way to strip QlikView's internal key fields from a SAP extract:
+
+```sh
+qvd2parquet --exclude '%*' A057.qvd a057.parquet
+```
+
+Patterns match the field's **original** QVD name, before any renaming, so they
+describe what you see in the source file. Excluding every column is an error.
+
+QVD field names from SAP extracts are often composite, packing the table, the
+technical name and a description into one string:
+
+```text
+A057-||-DATBI-||-Ende Gültigkeit
+```
+
+`--field-regex` rewrites them. Name the capture groups `name` and `comment` and
+no other flag is needed:
+
+```sh
+qvd2parquet \
+  --exclude '%*' \
+  --field-regex '^[^-]*-\|\|-(?P<name>[^-]*)-\|\|-(?P<comment>.*)$' \
+  A057.qvd a057.parquet
+```
+
+```text
+qvd2parquet: excluded 2 column(s) by pattern: %A057_PKEY, %SYS_TS
+qvd2parquet: schema: A057-||-DATBI-||-Ende Gültigkeit: INTEGER with 2 integer symbols, written as int64; written as "DATBI" with comment "Ende Gültigkeit"
+qvd2parquet: schema: A057-||-KBETR-||-Betrag: REAL with 2 double symbols promoted to decimal(4,2); scale 2 inferred from values; written as "KBETR" with comment "Betrag"
+```
+
+The result carries the description as Parquet field metadata, and keeps the
+original QVD name so nothing is lost:
+
+```text
+DATBI  int64             {"comment": "Ende Gültigkeit", "qvd.field": "A057-||-DATBI-||-Ende Gültigkeit"}
+KSCHL  string            {"comment": "Konditionsart",   "qvd.field": "A057-||-KSCHL-||-Konditionsart"}
+KBETR  decimal128(4, 2)  {"comment": "Betrag",          "qvd.field": "A057-||-KBETR-||-Betrag"}
+```
+
+Rules worth knowing:
+
+- A field the expression does not match keeps its original name and gets no
+  comment, so one rule can target a subset of the fields.
+- `--field-name` and `--field-comment` accept Go regexp templates (`$1`,
+  `${name}`) when named groups are not enough, e.g. `--field-name '${1}_${2}'`.
+- Two fields that collapse to the same output name are rejected as a schema
+  policy error rather than producing a duplicate Parquet column.
+- A regex with no `name` group and no explicit `--field-name` is rejected up
+  front, since it would blank every column name.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -224,9 +280,9 @@ declared `MONEY`/`FIX` is widened:
 
 | Value | Behaviour |
 | --- | --- |
-| `true` (default) | widen `int + float` to `float64` |
+| `decimal` (default) | resolve any column carrying fractional values to an exact decimal |
+| `true` | widen `int + float` to `float64` |
 | `false` | refuse to widen; a mixed numeric column is a policy error |
-| `decimal` | resolve any column carrying fractional values to an exact decimal |
 
 `--numeric-promote=decimal` exists because QlikView often declares a price as
 plain `REAL`. In that case the header carries no usable scale — `nDec` holds a
@@ -245,9 +301,12 @@ Pure-integer columns are left as `int64`, since `decimal(p,0)` would gain
 nothing, and a declared `MONEY`/`FIX` keeps using its own `nDec` rather than a
 value-inferred scale.
 
-If no scale within 9 decimals represents every value, the column follows
-`--decimal-strict`: it fails with a schema policy error under the default
-`true`, and falls back to `float64` under `false`.
+If no scale within 9 decimals represents every value, the column really is
+floating point and is written as `float64`. That fallback is silent by default,
+because the default is a preference rather than a demand and `float64` is what
+the column would have resolved to anyway. Passing `--numeric-promote=decimal`
+explicitly turns it into a demand: the conversion then fails with a schema
+policy error naming the column, so you can pin it with `--schema`.
 
 **Caveat worth knowing.** An inferred scale describes the data actually
 present, so a later extract containing a value with more decimals can resolve
@@ -271,14 +330,22 @@ scaled integers end to end, so no step of the pipeline rounds through a double.
 - `--decimal-source=auto` (the default) prefers the dual display string, which
   preserves decimal intent better than the binary double, and falls back to
   scaling the numeric payload. `text` and `numeric` force one source.
-- `--decimal-strict=true` (the default) fails when a value cannot be shown to be
-  exact at the declared scale. The tolerance used when scaling a double is only
-  large enough to absorb binary representation noise; it never accepts a value
-  with more decimal places than the scale allows.
-- `--decimal-strict=false` **rounds** such a value to the declared scale, half
-  away from zero. It is never dropped: silently turning an inexact value into a
-  null would lose data that no later check could recover, since the quality
-  metrics describe the converted value.
+- By default a value that does not fit the declared scale is **rounded** to it,
+  half away from zero — the same value Qlik itself displays for a field with
+  `nDec` decimals. Rounding is counted and reported, both on stderr and in
+  `--schema-report`, so it is never silent:
+
+  ```text
+  qvd2parquet: schema: Amount: MONEY, written as decimal(9,2); ...; 3 value(s) rounded to scale 2 (--decimal-strict=false)
+  qvd2parquet: note: 3 decimal value(s) were rounded to their column's scale; pass --decimal-strict to fail instead
+  ```
+
+- `--decimal-strict` restores the stricter behaviour: the conversion fails
+  naming the column and the offending value. Use it in a pipeline where an
+  unexpected precision change must stop the job. `--strict` implies it.
+- A value is never dropped. Turning an inexact value into a null would lose
+  data that no later check could recover, since the quality metrics describe
+  the converted value.
 
 The schema report records the resolved precision and scale and whether the
 digits came from display strings, numeric payloads, or both.

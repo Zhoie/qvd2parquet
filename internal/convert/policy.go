@@ -109,10 +109,10 @@ const (
 	// PromoteNone forbids widening; a column mixing integer and double
 	// symbols is a policy error.
 	PromoteNone NumericPromote = iota
-	// PromoteFloat64 widens to float64. Default.
+	// PromoteFloat64 widens to float64.
 	PromoteFloat64
 	// PromoteDecimal prefers an exact decimal, inferring the smallest scale
-	// at which every value is representable.
+	// at which every value is representable. Default.
 	PromoteDecimal
 )
 
@@ -172,27 +172,38 @@ func (q QualityMode) String() string {
 
 // Options is the resolved conversion configuration.
 type Options struct {
-	Columns             []string
-	Mixed               MixedStrategy
-	Dual                DualStrategy
-	NumericPromote      NumericPromote
-	MixedStringFallback bool
-	DecimalSource       DecimalSource
-	DecimalStrict       bool
-	Compression         string
-	BatchRows           int
-	Workers             int
-	Location            *time.Location
-	TimezoneName        string
-	SchemaOverridePath  string
-	SchemaReportPath    string
-	Quality             QualityMode
-	QualityReportPath   string
-	QualityRelTolerance float64
-	QualityAbsTolerance float64
-	ProgressEvery       int64
-	Force               bool
-	Strict              bool
+	Columns []string
+	// Exclude holds shell-style wildcard patterns; a field whose original QVD
+	// name matches one of them is not converted.
+	Exclude []string
+	// Renamer rewrites output column names and comments. Nil disables it.
+	Renamer        *FieldRenamer
+	Mixed          MixedStrategy
+	Dual           DualStrategy
+	NumericPromote NumericPromote
+	// NumericPromoteExplicit records that the user asked for this promotion
+	// mode rather than inheriting the default. An explicit request is a
+	// demand: decimal promotion then honours DecimalStrict and fails when no
+	// exact scale exists. The default is only a preference, so it falls back
+	// to float64 instead of failing an otherwise-valid conversion.
+	NumericPromoteExplicit bool
+	MixedStringFallback    bool
+	DecimalSource          DecimalSource
+	DecimalStrict          bool
+	Compression            string
+	BatchRows              int
+	Workers                int
+	Location               *time.Location
+	TimezoneName           string
+	SchemaOverridePath     string
+	SchemaReportPath       string
+	Quality                QualityMode
+	QualityReportPath      string
+	QualityRelTolerance    float64
+	QualityAbsTolerance    float64
+	ProgressEvery          int64
+	Force                  bool
+	Strict                 bool
 }
 
 // DefaultOptions returns the documented defaults.
@@ -200,9 +211,9 @@ func DefaultOptions() Options {
 	return Options{
 		Mixed:               MixedError,
 		Dual:                DualNumeric,
-		NumericPromote:      PromoteFloat64,
+		NumericPromote:      PromoteDecimal,
 		DecimalSource:       DecimalAuto,
-		DecimalStrict:       true,
+		DecimalStrict:       false,
 		Compression:         "zstd",
 		BatchRows:           65536,
 		Workers:             0,

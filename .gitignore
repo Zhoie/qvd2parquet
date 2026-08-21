@@ -1,0 +1,19 @@
+# Release artifacts
+/dist/
+
+# Local binaries
+/qvd2parquet
+/qvd2parquet.exe
+
+# Converter output and reports
+*.parquet
+*.parquet.tmp-*
+/*.quality.json
+/*.schema.json
+
+# Large regenerable fixtures (see testdata/README.md)
+/testdata/sample-large.qvd
+
+# Go
+*.test
+*.out

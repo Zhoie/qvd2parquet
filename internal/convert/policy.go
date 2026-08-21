@@ -1,0 +1,204 @@
+// Package convert resolves a Parquet schema from profiled QVD symbols and
+// converts QVD records into Arrow batches.
+package convert
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// MixedStrategy selects how columns holding more than one logical type are
+// resolved.
+type MixedStrategy int
+
+const (
+	// MixedError fails the conversion on an ambiguous column. Default.
+	MixedError MixedStrategy = iota
+	// MixedString writes the whole column as UTF-8.
+	MixedString
+	// MixedPromote widens int+float to float64 and keeps pure text as string.
+	MixedPromote
+	// MixedDualColumns emits a separate ${name}__text column for duals.
+	MixedDualColumns
+)
+
+// ParseMixedStrategy maps the --mixed flag value.
+func ParseMixedStrategy(s string) (MixedStrategy, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "error":
+		return MixedError, nil
+	case "string":
+		return MixedString, nil
+	case "promote":
+		return MixedPromote, nil
+	case "dual-columns":
+		return MixedDualColumns, nil
+	}
+	return 0, fmt.Errorf("invalid --mixed %q: want error|string|promote|dual-columns", s)
+}
+
+func (m MixedStrategy) String() string {
+	return [...]string{"error", "string", "promote", "dual-columns"}[m]
+}
+
+// DualStrategy selects which side of a Qlik dual value is written.
+type DualStrategy int
+
+const (
+	// DualNumeric writes the numeric side. Default.
+	DualNumeric DualStrategy = iota
+	// DualText writes the display string.
+	DualText
+	// DualColumns writes both, in two Parquet columns.
+	DualColumns
+)
+
+// ParseDualStrategy maps the --dual flag value.
+func ParseDualStrategy(s string) (DualStrategy, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "numeric":
+		return DualNumeric, nil
+	case "text":
+		return DualText, nil
+	case "columns":
+		return DualColumns, nil
+	}
+	return 0, fmt.Errorf("invalid --dual %q: want numeric|text|columns", s)
+}
+
+func (d DualStrategy) String() string {
+	return [...]string{"numeric", "text", "columns"}[d]
+}
+
+// DecimalSource selects where exact decimal digits are taken from.
+type DecimalSource int
+
+const (
+	// DecimalAuto prefers the dual display string and falls back to the
+	// binary numeric payload. Default.
+	DecimalAuto DecimalSource = iota
+	// DecimalText requires a display string.
+	DecimalText
+	// DecimalNumeric always scales the binary numeric payload.
+	DecimalNumeric
+)
+
+// ParseDecimalSource maps the --decimal-source flag value.
+func ParseDecimalSource(s string) (DecimalSource, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "auto":
+		return DecimalAuto, nil
+	case "text":
+		return DecimalText, nil
+	case "numeric":
+		return DecimalNumeric, nil
+	}
+	return 0, fmt.Errorf("invalid --decimal-source %q: want auto|text|numeric", s)
+}
+
+func (d DecimalSource) String() string {
+	return [...]string{"auto", "text", "numeric"}[d]
+}
+
+// QualityMode selects how thoroughly the written Parquet file is validated.
+type QualityMode int
+
+const (
+	// QualityNone skips post-write validation. Default.
+	QualityNone QualityMode = iota
+	// QualityBasic validates row counts, schema and null counts.
+	QualityBasic
+	// QualityNumeric adds numeric/date/time aggregates.
+	QualityNumeric
+	// QualityFull adds order-independent value fingerprints.
+	QualityFull
+)
+
+// ParseQualityMode maps the --quality-gate flag value.
+func ParseQualityMode(s string) (QualityMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "none":
+		return QualityNone, nil
+	case "basic":
+		return QualityBasic, nil
+	case "numeric":
+		return QualityNumeric, nil
+	case "full":
+		return QualityFull, nil
+	}
+	return 0, fmt.Errorf("invalid --quality-gate %q: want none|basic|numeric|full", s)
+}
+
+func (q QualityMode) String() string {
+	return [...]string{"none", "basic", "numeric", "full"}[q]
+}
+
+// Options is the resolved conversion configuration.
+type Options struct {
+	Columns             []string
+	Mixed               MixedStrategy
+	Dual                DualStrategy
+	NumericPromote      bool
+	MixedStringFallback bool
+	DecimalSource       DecimalSource
+	DecimalStrict       bool
+	Compression         string
+	BatchRows           int
+	Workers             int
+	Location            *time.Location
+	TimezoneName        string
+	SchemaOverridePath  string
+	SchemaReportPath    string
+	Quality             QualityMode
+	QualityReportPath   string
+	QualityRelTolerance float64
+	QualityAbsTolerance float64
+	ProgressEvery       int64
+	Force               bool
+	Strict              bool
+}
+
+// DefaultOptions returns the documented defaults.
+func DefaultOptions() Options {
+	return Options{
+		Mixed:               MixedError,
+		Dual:                DualNumeric,
+		NumericPromote:      true,
+		DecimalSource:       DecimalAuto,
+		DecimalStrict:       true,
+		Compression:         "zstd",
+		BatchRows:           65536,
+		Workers:             0,
+		Location:            time.Local,
+		TimezoneName:        "Local",
+		Quality:             QualityNone,
+		QualityRelTolerance: 1e-9,
+		QualityAbsTolerance: 0,
+		ProgressEvery:       1000000,
+	}
+}
+
+// Validate checks the option combination.
+func (o *Options) Validate() error {
+	if o.BatchRows <= 0 {
+		return fmt.Errorf("--batch-rows must be positive, got %d", o.BatchRows)
+	}
+	if o.Workers < 0 {
+		return fmt.Errorf("--workers must not be negative, got %d", o.Workers)
+	}
+	if o.QualityRelTolerance < 0 || o.QualityAbsTolerance < 0 {
+		return fmt.Errorf("quality tolerances must not be negative")
+	}
+	if o.ProgressEvery < 0 {
+		return fmt.Errorf("--progress must not be negative, got %d", o.ProgressEvery)
+	}
+	if o.Location == nil {
+		o.Location = time.Local
+	}
+	// --mixed=dual-columns implies emitting both sides of a dual.
+	if o.Mixed == MixedDualColumns && o.Dual != DualColumns {
+		o.Dual = DualColumns
+	}
+	return nil
+}

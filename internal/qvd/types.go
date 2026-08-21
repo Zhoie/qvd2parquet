@@ -1,0 +1,293 @@
+// Package qvd implements parsing of Qlik QVD files: XML header, symbol
+// tables and bit-stuffed fixed-width records. It has no Parquet or Arrow
+// dependency.
+package qvd
+
+import "fmt"
+
+// QlikType is the declared NumberFormat/Type of a QVD field.
+type QlikType int
+
+const (
+	QlikUnknown QlikType = iota
+	QlikASCII
+	QlikDate
+	QlikTimestamp
+	QlikTime
+	QlikInteger
+	QlikReal
+	QlikFix
+	QlikMoney
+)
+
+func (t QlikType) String() string {
+	switch t {
+	case QlikASCII:
+		return "ASCII"
+	case QlikDate:
+		return "DATE"
+	case QlikTimestamp:
+		return "TIMESTAMP"
+	case QlikTime:
+		return "TIME"
+	case QlikInteger:
+		return "INTEGER"
+	case QlikReal:
+		return "REAL"
+	case QlikFix:
+		return "FIX"
+	case QlikMoney:
+		return "MONEY"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// IsDateTime reports whether the type carries Qlik serial date/time semantics.
+func (t QlikType) IsDateTime() bool {
+	return t == QlikDate || t == QlikTimestamp || t == QlikTime
+}
+
+// IsDecimal reports whether the type must be preserved as an exact decimal.
+func (t QlikType) IsDecimal() bool {
+	return t == QlikFix || t == QlikMoney
+}
+
+// ParseQlikType maps the header's NumberFormat/Type string onto QlikType.
+func ParseQlikType(s string) QlikType {
+	switch s {
+	case "ASCII":
+		return QlikASCII
+	case "DATE":
+		return QlikDate
+	case "TIMESTAMP":
+		return QlikTimestamp
+	case "TIME":
+		return QlikTime
+	case "INTEGER":
+		return QlikInteger
+	case "REAL":
+		return QlikReal
+	case "FIX":
+		return QlikFix
+	case "MONEY":
+		return QlikMoney
+	default:
+		return QlikUnknown
+	}
+}
+
+// Column is the normalized per-field metadata used by the decoder.
+type Column struct {
+	Index       int
+	Name        string
+	QlikType    QlikType
+	BitOffset   int
+	BitWidth    int
+	Bias        int64
+	SymbolCount int64
+	Offset      int64
+	Length      int64
+	Selected    bool
+
+	// NDec is NumberFormat/nDec, the declared number of decimals. It is only
+	// meaningful for the decimal-like types.
+	NDec int
+	// DecSep is the declared decimal separator from NumberFormat/Dec.
+	DecSep string
+	// ThouSep is the declared thousands separator from NumberFormat/Thou.
+	ThouSep string
+	// Fmt is the declared display format string.
+	Fmt string
+}
+
+// SymbolKind describes which sides of a decoded symbol carry a value.
+type SymbolKind uint8
+
+const (
+	SymbolNull SymbolKind = iota
+	SymbolString
+	SymbolInt
+	SymbolFloat
+	SymbolDualIntString
+	SymbolDualFloatString
+)
+
+func (k SymbolKind) String() string {
+	switch k {
+	case SymbolString:
+		return "string"
+	case SymbolInt:
+		return "int"
+	case SymbolFloat:
+		return "float"
+	case SymbolDualIntString:
+		return "dualInt"
+	case SymbolDualFloatString:
+		return "dualFloat"
+	default:
+		return "null"
+	}
+}
+
+// HasNumeric reports whether the symbol carries a numeric payload.
+func (k SymbolKind) HasNumeric() bool {
+	return k == SymbolInt || k == SymbolFloat || k == SymbolDualIntString || k == SymbolDualFloatString
+}
+
+// HasText reports whether the symbol carries a display string.
+func (k SymbolKind) HasText() bool {
+	return k == SymbolString || k == SymbolDualIntString || k == SymbolDualFloatString
+}
+
+// Symbol is one entry of a QVD symbol table. Dual values keep both sides.
+type Symbol struct {
+	Kind  SymbolKind
+	Int   int64
+	Float float64
+	Text  string
+}
+
+// Numeric returns the symbol's numeric value as a float64 and whether one exists.
+func (s Symbol) Numeric() (float64, bool) {
+	switch s.Kind {
+	case SymbolInt, SymbolDualIntString:
+		return float64(s.Int), true
+	case SymbolFloat, SymbolDualFloatString:
+		return s.Float, true
+	}
+	return 0, false
+}
+
+// ColumnProfile counts the symbol kinds actually present in a column and is the
+// single place where mixed-type detection happens.
+type ColumnProfile struct {
+	Symbols    int64   `json:"symbols"`
+	Nulls      int64   `json:"nulls"`
+	Strings    int64   `json:"strings"`
+	Ints       int64   `json:"ints"`
+	Floats     int64   `json:"floats"`
+	DualInts   int64   `json:"dualInts"`
+	DualFloats int64   `json:"dualFloats"`
+	EmptyText  int64   `json:"emptyText"`
+	MaxTextLen int     `json:"maxTextLen"`
+	MinInt     int64   `json:"minInt"`
+	MaxInt     int64   `json:"maxInt"`
+	MinFloat   float64 `json:"minFloat"`
+	MaxFloat   float64 `json:"maxFloat"`
+
+	hasInt   bool
+	hasFloat bool
+}
+
+// Observe folds one symbol into the profile.
+func (p *ColumnProfile) Observe(s Symbol) {
+	p.Symbols++
+	switch s.Kind {
+	case SymbolNull:
+		p.Nulls++
+	case SymbolString:
+		p.Strings++
+	case SymbolInt:
+		p.Ints++
+	case SymbolFloat:
+		p.Floats++
+	case SymbolDualIntString:
+		p.DualInts++
+	case SymbolDualFloatString:
+		p.DualFloats++
+	}
+	if s.Kind.HasText() {
+		if s.Text == "" {
+			p.EmptyText++
+		}
+		if len(s.Text) > p.MaxTextLen {
+			p.MaxTextLen = len(s.Text)
+		}
+	}
+	switch s.Kind {
+	case SymbolInt, SymbolDualIntString:
+		if !p.hasInt {
+			p.MinInt, p.MaxInt, p.hasInt = s.Int, s.Int, true
+		} else {
+			if s.Int < p.MinInt {
+				p.MinInt = s.Int
+			}
+			if s.Int > p.MaxInt {
+				p.MaxInt = s.Int
+			}
+		}
+	case SymbolFloat, SymbolDualFloatString:
+		if !p.hasFloat {
+			p.MinFloat, p.MaxFloat, p.hasFloat = s.Float, s.Float, true
+		} else {
+			if s.Float < p.MinFloat {
+				p.MinFloat = s.Float
+			}
+			if s.Float > p.MaxFloat {
+				p.MaxFloat = s.Float
+			}
+		}
+	}
+}
+
+// TextOnly counts symbols that carry only a display string.
+func (p *ColumnProfile) TextOnly() int64 { return p.Strings }
+
+// IntLike counts symbols whose numeric side is an integer.
+func (p *ColumnProfile) IntLike() int64 { return p.Ints + p.DualInts }
+
+// FloatLike counts symbols whose numeric side is a double.
+func (p *ColumnProfile) FloatLike() int64 { return p.Floats + p.DualFloats }
+
+// Numeric counts symbols carrying any numeric payload.
+func (p *ColumnProfile) Numeric() int64 { return p.IntLike() + p.FloatLike() }
+
+// HasOnlyNulls reports whether the column has no value-bearing symbol.
+func (p *ColumnProfile) HasOnlyNulls() bool { return p.Symbols == 0 || p.Nulls == p.Symbols }
+
+// HasOnlyText reports whether every non-null symbol is a plain string.
+func (p *ColumnProfile) HasOnlyText() bool { return p.Strings > 0 && p.Numeric() == 0 }
+
+// HasOnlyInts reports whether every non-null symbol has an integer numeric side.
+func (p *ColumnProfile) HasOnlyInts() bool {
+	return p.IntLike() > 0 && p.FloatLike() == 0 && p.Strings == 0
+}
+
+// HasOnlyFloats reports whether every non-null symbol has a double numeric side.
+func (p *ColumnProfile) HasOnlyFloats() bool {
+	return p.FloatLike() > 0 && p.IntLike() == 0 && p.Strings == 0
+}
+
+// HasOnlyNumeric reports whether no plain-string symbol is present.
+func (p *ColumnProfile) HasOnlyNumeric() bool { return p.Numeric() > 0 && p.Strings == 0 }
+
+// HasDuals reports whether any symbol carries both a numeric and a text side.
+func (p *ColumnProfile) HasDuals() bool { return p.DualInts+p.DualFloats > 0 }
+
+// HasMixedScalarFamilies reports whether plain strings coexist with numerics.
+func (p *ColumnProfile) HasMixedScalarFamilies() bool { return p.Strings > 0 && p.Numeric() > 0 }
+
+// CanPromoteIntToFloat reports whether the column mixes integer and double
+// numeric payloads and could be widened to float64.
+func (p *ColumnProfile) CanPromoteIntToFloat() bool {
+	return p.IntLike() > 0 && p.FloatLike() > 0 && p.Strings == 0
+}
+
+// CanUseQlikDeclaredType reports whether the declared type is consistent with
+// the symbols actually found.
+func (p *ColumnProfile) CanUseQlikDeclaredType(t QlikType) bool {
+	switch t {
+	case QlikASCII:
+		return p.Numeric() == 0
+	case QlikDate, QlikTimestamp, QlikTime, QlikInteger, QlikReal, QlikFix, QlikMoney:
+		return p.Strings == 0
+	}
+	return false
+}
+
+// Describe renders a short human-readable summary used in error messages.
+func (p *ColumnProfile) Describe() string {
+	return fmt.Sprintf("%d symbols (%d null, %d int, %d float, %d string, %d dualInt, %d dualFloat)",
+		p.Symbols, p.Nulls, p.Ints, p.Floats, p.Strings, p.DualInts, p.DualFloats)
+}

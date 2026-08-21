@@ -70,7 +70,7 @@ func run() int {
 		columns       = fs.String("columns", "", "Convert only these comma-separated columns")
 		mixed         = fs.String("mixed", def.Mixed.String(), "Mixed-type strategy: error|string|promote|dual-columns")
 		dual          = fs.String("dual", def.Dual.String(), "Dual strategy: numeric|text|columns")
-		promote       = fs.Bool("numeric-promote", def.NumericPromote, "Allow int+float promotion to float64")
+		promote       = fs.String("numeric-promote", def.NumericPromote.String(), "Numeric widening: true (float64) | false | decimal (exact, scale inferred from values)")
 		strFallback   = fs.Bool("mixed-string-fallback", def.MixedStringFallback, "Convert otherwise-invalid mixed columns to string")
 		decSource     = fs.String("decimal-source", def.DecimalSource.String(), "Decimal extraction: auto|text|numeric")
 		decStrict     = fs.Bool("decimal-strict", def.DecimalStrict, "Fail if exact decimal conversion cannot be proven")
@@ -109,7 +109,6 @@ func run() int {
 	inputPath, outputPath := fs.Arg(0), fs.Arg(1)
 
 	opts := def
-	opts.NumericPromote = *promote
 	opts.MixedStringFallback = *strFallback
 	opts.DecimalStrict = *decStrict
 	opts.Compression = *compression
@@ -133,6 +132,9 @@ func run() int {
 	}
 
 	var err error
+	if opts.NumericPromote, err = convert.ParseNumericPromote(*promote); err != nil {
+		return usageErr(err)
+	}
 	if opts.Mixed, err = convert.ParseMixedStrategy(*mixed); err != nil {
 		return usageErr(err)
 	}
@@ -156,7 +158,7 @@ func run() int {
 		// Strict mode refuses any silent type widening or lossy decimal.
 		opts.DecimalStrict = true
 		if !fsSet(fs, "numeric-promote") {
-			opts.NumericPromote = false
+			opts.NumericPromote = convert.PromoteNone
 		}
 	}
 	if err := opts.Validate(); err != nil {

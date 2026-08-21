@@ -121,7 +121,7 @@ func TestIntPlusFloatPromotes(t *testing.T) {
 		t.Errorf("strategy = %v, want StrategyFloat64", rs.Columns[0].Strategy)
 	}
 
-	_, err := resolve(t, f, func(o *Options) { o.NumericPromote = false })
+	_, err := resolve(t, f, func(o *Options) { o.NumericPromote = PromoteNone })
 	if !errors.Is(err, ErrSchemaPolicy) {
 		t.Fatalf("err = %v, want ErrSchemaPolicy", err)
 	}

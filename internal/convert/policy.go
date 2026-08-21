@@ -101,6 +101,42 @@ func (d DecimalSource) String() string {
 	return [...]string{"auto", "text", "numeric"}[d]
 }
 
+// NumericPromote selects how a numeric column that is not already a declared
+// decimal type is widened.
+type NumericPromote int
+
+const (
+	// PromoteNone forbids widening; a column mixing integer and double
+	// symbols is a policy error.
+	PromoteNone NumericPromote = iota
+	// PromoteFloat64 widens to float64. Default.
+	PromoteFloat64
+	// PromoteDecimal prefers an exact decimal, inferring the smallest scale
+	// at which every value is representable.
+	PromoteDecimal
+)
+
+// ParseNumericPromote maps the --numeric-promote flag value. The historical
+// boolean spellings stay valid.
+func ParseNumericPromote(s string) (NumericPromote, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "false", "0", "none", "off":
+		return PromoteNone, nil
+	case "true", "1", "float64", "on":
+		return PromoteFloat64, nil
+	case "decimal":
+		return PromoteDecimal, nil
+	}
+	return 0, fmt.Errorf("invalid --numeric-promote %q: want true|false|decimal", s)
+}
+
+func (n NumericPromote) String() string {
+	return [...]string{"false", "true", "decimal"}[n]
+}
+
+// Enabled reports whether any widening is permitted.
+func (n NumericPromote) Enabled() bool { return n != PromoteNone }
+
 // QualityMode selects how thoroughly the written Parquet file is validated.
 type QualityMode int
 
@@ -139,7 +175,7 @@ type Options struct {
 	Columns             []string
 	Mixed               MixedStrategy
 	Dual                DualStrategy
-	NumericPromote      bool
+	NumericPromote      NumericPromote
 	MixedStringFallback bool
 	DecimalSource       DecimalSource
 	DecimalStrict       bool
@@ -164,7 +200,7 @@ func DefaultOptions() Options {
 	return Options{
 		Mixed:               MixedError,
 		Dual:                DualNumeric,
-		NumericPromote:      true,
+		NumericPromote:      PromoteFloat64,
 		DecimalSource:       DecimalAuto,
 		DecimalStrict:       true,
 		Compression:         "zstd",

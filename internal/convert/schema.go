@@ -347,6 +347,14 @@ func resolveNumericColumn(base ResolvedColumn, col qvd.Column, prof *qvd.ColumnP
 		return resolveDecimalColumn(base, col, syms, opts)
 	}
 
+	// --numeric-promote=decimal prefers an exact decimal over a binary double
+	// for any column carrying fractional values. Pure-integer columns stay
+	// int64, since decimal(p,0) would gain nothing. The declared MONEY/FIX
+	// types are already handled above and are unaffected.
+	if opts.NumericPromote == PromoteDecimal && prof.FloatLike() > 0 && prof.Strings == 0 {
+		return resolvePromotedDecimalColumn(base, col, prof, syms, opts)
+	}
+
 	// INTEGER, REAL, ASCII-with-numbers and UNKNOWN fall through to the
 	// profile-driven choice.
 	switch {
@@ -361,12 +369,13 @@ func resolveNumericColumn(base ResolvedColumn, col qvd.Column, prof *qvd.ColumnP
 			col.Name, col.QlikType, prof.FloatLike()), nil
 
 	case prof.CanPromoteIntToFloat():
-		allowed := opts.NumericPromote &&
+		allowed := opts.NumericPromote.Enabled() &&
 			(opts.Mixed == MixedPromote || opts.Mixed == MixedError || opts.Mixed == MixedDualColumns)
 		if !allowed {
 			return ResolvedColumn{}, "", fmt.Errorf(
 				"%w: mixed type column %q: symbols contain %d integers and %d doubles; "+
-					"enable --numeric-promote to widen the column to float64, or use --mixed=string",
+					"use --numeric-promote=true to widen the column to float64, "+
+					"--numeric-promote=decimal for an exact decimal, or --mixed=string",
 				ErrSchemaPolicy, col.Name, prof.IntLike(), prof.FloatLike())
 		}
 		base.ArrowType, base.Strategy = arrowF64, StrategyFloat64
@@ -376,6 +385,54 @@ func resolveNumericColumn(base ResolvedColumn, col qvd.Column, prof *qvd.ColumnP
 
 	return ResolvedColumn{}, "", fmt.Errorf("%w: column %q: cannot resolve a type from %s",
 		ErrSchemaPolicy, col.Name, prof.Describe())
+}
+
+// resolvePromotedDecimalColumn resolves a REAL-ish column to an exact decimal
+// under --numeric-promote=decimal. The declared NumberFormat/nDec is not
+// trustworthy here (Qlik writes a filler value for REAL), so the scale is
+// derived from the values themselves.
+func resolvePromotedDecimalColumn(base ResolvedColumn, col qvd.Column, prof *qvd.ColumnProfile,
+	syms []qvd.Symbol, opts *Options) (ResolvedColumn, string, error) {
+
+	scale, ok := InferScaleFromValues(syms)
+	if !ok {
+		if !opts.DecimalStrict {
+			base.ArrowType, base.Strategy = arrowF64, StrategyFloat64
+			return base, fmt.Sprintf(
+				"%s: --numeric-promote=decimal found no exact scale within %d decimals; "+
+					"written as float64 because --decimal-strict=false",
+				col.Name, MaxInferredDecimalScale), nil
+		}
+		return ResolvedColumn{}, "", fmt.Errorf(
+			"%w: column %q: --numeric-promote=decimal cannot derive an exact scale within %d decimals "+
+				"(the declared %s carries no usable NumberFormat/nDec); pin it with "+
+				"--schema {\"columns\":{%q:{\"type\":\"decimal\",\"precision\":18,\"scale\":2}}}, "+
+				"or use --decimal-strict=false to fall back to float64",
+			ErrSchemaPolicy, col.Name, MaxInferredDecimalScale, col.QlikType, col.Name)
+	}
+
+	ex := &DecimalExtractor{
+		Scale:   scale,
+		Source:  DecimalNumeric, // the numeric side is what was profiled
+		Strict:  opts.DecimalStrict,
+		DecSep:  col.DecSep,
+		ThouSep: col.ThouSep,
+	}
+	spec, scaled, err := ResolveDecimalSpec(col.Name, syms, ex)
+	if err != nil {
+		return ResolvedColumn{}, "", fmt.Errorf("%w: %s", ErrSchemaPolicy, err)
+	}
+
+	base.ArrowType = &arrow.Decimal128Type{Precision: spec.Precision, Scale: spec.Scale}
+	base.Strategy, base.Decimal, base.Scaled = StrategyDecimal, spec, scaled
+	base.DecimalFromNumeric = true
+
+	mix := fmt.Sprintf("%d double symbols", prof.FloatLike())
+	if prof.IntLike() > 0 {
+		mix = fmt.Sprintf("%d integer and %d double symbols", prof.IntLike(), prof.FloatLike())
+	}
+	return base, fmt.Sprintf("%s: %s with %s promoted to %s; scale %d inferred from values",
+		col.Name, col.QlikType, mix, spec, scale), nil
 }
 
 // resolveDecimalColumn resolves MONEY/FIX to an exact Parquet decimal.

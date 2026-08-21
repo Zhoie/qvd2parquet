@@ -76,7 +76,7 @@ qvd2parquet [options] input.qvd output.parquet
   -columns name1,name2       Convert only these columns
   -mixed error               Mixed-type strategy: error|string|promote|dual-columns
   -dual numeric              Dual strategy: numeric|text|columns
-  -numeric-promote           Allow int+float promotion to float64 (default true)
+  -numeric-promote true      Numeric widening: true (float64) | false | decimal
   -mixed-string-fallback     Convert otherwise-invalid mixed columns to string
   -decimal-source auto       Decimal extraction: auto|text|numeric
   -decimal-strict            Fail if exact decimal conversion cannot be proven (default true)
@@ -192,7 +192,8 @@ A QVD column can hold several symbol encodings at once. Some combinations are
 harmless, some are not:
 
 - `int + null`, `float + null` — fine.
-- `int + float` — widened to `float64` when `--numeric-promote` is on (the default).
+- `int + float` — widened to `float64` when `--numeric-promote` is on (the default),
+  or to an exact decimal with `--numeric-promote=decimal`.
 - dual numeric + display string — a normal Qlik concept, resolved by `--dual`.
 - number + unrelated text — never silently made numeric.
 
@@ -215,6 +216,47 @@ schema policy error rather than writing an ambiguous Parquet schema.
 The defaults — `--mixed=error --numeric-promote=true --dual=numeric
 --mixed-string-fallback=false` — stop an ETL job on unexpected schema drift
 while still handling the common `int + float` and dual-numeric cases.
+
+### Numeric widening
+
+`--numeric-promote` controls how a numeric column that is **not** already a
+declared `MONEY`/`FIX` is widened:
+
+| Value | Behaviour |
+| --- | --- |
+| `true` (default) | widen `int + float` to `float64` |
+| `false` | refuse to widen; a mixed numeric column is a policy error |
+| `decimal` | resolve any column carrying fractional values to an exact decimal |
+
+`--numeric-promote=decimal` exists because QlikView often declares a price as
+plain `REAL`. In that case the header carries no usable scale — `nDec` holds a
+filler value (commonly 14) and the display format has no decimal separator — so
+the scale is derived from the values themselves: the smallest scale at which
+every value is exactly representable, up to 9 decimals.
+
+```text
+$ qvd2parquet --numeric-promote=decimal products.qvd out.parquet
+qvd2parquet: schema: Einkaufspreis: REAL with 75 double symbols promoted to decimal(5,2); scale 2 inferred from values
+qvd2parquet: schema: Listenpreis: REAL with 25 integer and 35 double symbols promoted to decimal(5,2); scale 2 inferred from values
+qvd2parquet: schema: MengeAufLager: INTEGER with 51 integer symbols, written as int64
+```
+
+Pure-integer columns are left as `int64`, since `decimal(p,0)` would gain
+nothing, and a declared `MONEY`/`FIX` keeps using its own `nDec` rather than a
+value-inferred scale.
+
+If no scale within 9 decimals represents every value, the column follows
+`--decimal-strict`: it fails with a schema policy error under the default
+`true`, and falls back to `float64` under `false`.
+
+**Caveat worth knowing.** An inferred scale describes the data actually
+present, so a later extract containing a value with more decimals can resolve
+the same column to a different scale. For a pipeline that must produce a
+stable schema across runs, pin the column instead:
+
+```json
+{ "columns": { "Listenpreis": { "type": "decimal", "precision": 18, "scale": 2 } } }
+```
 
 ### Exact decimals
 

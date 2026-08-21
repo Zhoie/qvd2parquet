@@ -222,3 +222,71 @@ func readReferenceCSV(t *testing.T, path string) []map[string]string {
 	}
 	return out
 }
+
+// --numeric-promote=decimal on the real QlikView fixture: both price columns
+// must become exact decimals while the quantity columns stay integers. The
+// file declares them REAL with nDec=14 and a format carrying no decimal
+// separator, so the scale can only come from the values.
+func TestRealQVDDecimalPromotion(t *testing.T) {
+	in := realFixture("products.qvd")
+	out := filepath.Join(t.TempDir(), "promoted.parquet")
+
+	opts := testOptions()
+	opts.NumericPromote = PromoteDecimal
+	opts.Quality = QualityFull
+	_, report, err := Run(context.Background(), in, out, &opts, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !report.Passed {
+		t.Fatalf("full quality gate failed: %+v", report)
+	}
+
+	types := map[string]string{}
+	for _, c := range report.Columns {
+		types[c.Name] = c.Type
+	}
+	for name, want := range map[string]string{
+		"Einkaufspreis": "decimal(5, 2)",
+		"Listenpreis":   "decimal(5, 2)",
+		"MengeAufLager": "int64", // a quantity gains nothing from decimal(p,0)
+		"KategorieNr":   "int64",
+		"Produktname":   "utf8",
+	} {
+		if types[name] != want {
+			t.Errorf("column %q resolved to %q, want %q", name, types[name], want)
+		}
+	}
+
+	// The decimal sum must be exact, and must agree with the float64 run.
+	var decSum string
+	for _, c := range report.Columns {
+		if c.Name == "Listenpreis" {
+			decSum = c.Source.Sum
+		}
+	}
+	if decSum == "" {
+		t.Fatal("no Listenpreis metrics in the report")
+	}
+
+	floatOpts := testOptions()
+	floatOpts.Quality = QualityNumeric
+	floatOut := filepath.Join(t.TempDir(), "float.parquet")
+	_, floatReport, err := Run(context.Background(), in, floatOut, &floatOpts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range floatReport.Columns {
+		if c.Name != "Listenpreis" {
+			continue
+		}
+		dec, errD := strconv.ParseFloat(decSum, 64)
+		flt, errF := strconv.ParseFloat(c.Source.Sum, 64)
+		if errD != nil || errF != nil {
+			t.Fatalf("unparseable sums %q / %q", decSum, c.Source.Sum)
+		}
+		if math.Abs(dec-flt) > 1e-6 {
+			t.Errorf("decimal sum %s disagrees with the float64 sum %s", decSum, c.Source.Sum)
+		}
+	}
+}

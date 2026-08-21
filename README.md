@@ -142,6 +142,16 @@ qvd2parquet --columns CustomerID,OrderDate,Amount --batch-rows 16384 --workers 4
   orders.qvd orders.parquet
 ```
 
+Strip QlikView's internal key fields and shorten composite SAP field names,
+keeping the description as a column comment:
+
+```sh
+qvd2parquet \
+  --exclude '%*' \
+  --field-regex '^[^-]*-\|\|-(?P<name>[^-]*)-\|\|-(?P<comment>.*)$' \
+  A057.qvd a057.parquet
+```
+
 Understand why a column resolved the way it did:
 
 ```sh
@@ -232,7 +242,7 @@ producing an unstable schema that depends on which rows were seen first.
 | QVD field | Parquet / Arrow type |
 | --- | --- |
 | `INTEGER` with integer symbols | `int64` |
-| `REAL` with double symbols | `float64` |
+| `REAL` with double symbols | `decimal128(p, s)`, scale inferred from the values; `float64` if no exact scale exists |
 | `MONEY`, `FIX` | `decimal128(p, s)` — never `float64` |
 | `DATE` | `date32` (days since the Unix epoch) |
 | `TIMESTAMP` | `timestamp[ms, tz=<--timezone>]` |
@@ -248,8 +258,9 @@ A QVD column can hold several symbol encodings at once. Some combinations are
 harmless, some are not:
 
 - `int + null`, `float + null` — fine.
-- `int + float` — widened to `float64` when `--numeric-promote` is on (the default),
-  or to an exact decimal with `--numeric-promote=decimal`.
+- `int + float` — resolved to an exact decimal by default
+  (`--numeric-promote=decimal`), or widened to `float64` with
+  `--numeric-promote=true`.
 - dual numeric + display string — a normal Qlik concept, resolved by `--dual`.
 - number + unrelated text — never silently made numeric.
 
@@ -269,7 +280,7 @@ Output column names must be unique. If a generated `${name}__text` column would
 collide with a real source column of that name, the conversion fails with a
 schema policy error rather than writing an ambiguous Parquet schema.
 
-The defaults — `--mixed=error --numeric-promote=true --dual=numeric
+The defaults — `--mixed=error --numeric-promote=decimal --dual=numeric
 --mixed-string-fallback=false` — stop an ETL job on unexpected schema drift
 while still handling the common `int + float` and dual-numeric cases.
 
@@ -291,7 +302,7 @@ the scale is derived from the values themselves: the smallest scale at which
 every value is exactly representable, up to 9 decimals.
 
 ```text
-$ qvd2parquet --numeric-promote=decimal products.qvd out.parquet
+$ qvd2parquet products.qvd out.parquet          # decimal is the default
 qvd2parquet: schema: Einkaufspreis: REAL with 75 double symbols promoted to decimal(5,2); scale 2 inferred from values
 qvd2parquet: schema: Listenpreis: REAL with 25 integer and 35 double symbols promoted to decimal(5,2); scale 2 inferred from values
 qvd2parquet: schema: MengeAufLager: INTEGER with 51 integer symbols, written as int64

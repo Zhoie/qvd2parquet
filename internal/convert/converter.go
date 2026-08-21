@@ -101,6 +101,28 @@ func Run(ctx context.Context, inputPath, outputPath string, opts *Options, logf 
 	if nonFinite > 0 {
 		logf("note: %d value(s) are NaN or infinite and were written as null", nonFinite)
 	}
+	if opts.EmptyStringAsNull {
+		// Count per output column what that column will actually null. A
+		// dual's text column nulls empty display strings, including those on
+		// duals; every other column nulls only symbols that are nothing but an
+		// empty string, since a dual's number survives its blank text.
+		var empty int64
+		for _, c := range rs.Columns {
+			p := f.Profiles[c.SourceIndex]
+			if p == nil {
+				continue
+			}
+			if c.Strategy == StrategyDualText {
+				empty += p.EmptyText
+			} else {
+				empty += p.EmptyStrings
+			}
+		}
+		if empty > 0 {
+			logf("note: %d empty string symbol(s) written as null; "+
+				"pass --empty-as-null=false to keep them as empty strings", empty)
+		}
+	}
 
 	if opts.SchemaReportPath != "" {
 		if err := WriteSchemaReport(opts.SchemaReportPath, inputPath, f, rs); err != nil {

@@ -2,7 +2,9 @@ package convert
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -185,8 +187,13 @@ func readParquetMetrics(path string, rs *ResolvedSchema, opts *Options) (*Metric
 	var rows int64
 	for {
 		rec, err := rr.Read()
-		if err != nil {
+		if errors.Is(err, io.EOF) {
 			break
+		}
+		if err != nil {
+			// Do not treat a read failure as end-of-data: that would compare
+			// partial metrics and could pass a corrupt file.
+			return nil, 0, nil, fmt.Errorf("read Parquet records from %s: %w", path, err)
 		}
 		if rec == nil {
 			break

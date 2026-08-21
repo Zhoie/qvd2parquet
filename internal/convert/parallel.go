@@ -100,13 +100,22 @@ func (c *Converter) Run(ctx context.Context, sink RecordSink, progress ProgressF
 	results := make(chan DecodeResult, workers)
 
 	var wg sync.WaitGroup
-	var errOnce sync.Once
+	// firstErr is written by whichever worker fails first and read by the
+	// writer loop below, so both sides must hold errMu.
+	var errMu sync.Mutex
 	var firstErr error
 	fail := func(err error) {
-		errOnce.Do(func() {
+		errMu.Lock()
+		if firstErr == nil {
 			firstErr = err
 			cancel()
-		})
+		}
+		errMu.Unlock()
+	}
+	failed := func() bool {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return firstErr != nil
 	}
 
 	// Feeder.
@@ -157,7 +166,7 @@ func (c *Converter) Run(ctx context.Context, sink RecordSink, progress ProgressF
 	var written, lastReported int64
 	nextProgress := c.Options.ProgressEvery
 	for res := range results {
-		if firstErr == nil {
+		if !failed() {
 			if err := sink.Write(res.Record); err != nil {
 				fail(err)
 			} else {
@@ -175,8 +184,11 @@ func (c *Converter) Run(ctx context.Context, sink RecordSink, progress ProgressF
 		res.Record.Release()
 	}
 
-	if firstErr != nil {
-		return nil, firstErr
+	errMu.Lock()
+	runErr := firstErr
+	errMu.Unlock()
+	if runErr != nil {
+		return nil, runErr
 	}
 	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		return nil, err
@@ -223,9 +235,17 @@ func (w *worker) decodeChunk(ch DecodeChunk) (DecodeResult, error) {
 	f := w.c.File
 	size := ch.RowCount * f.RecordByteSize
 	buf := w.raw[:size]
-	if _, err := w.file.ReadAt(buf, ch.ByteOffset); err != nil && !errors.Is(err, io.EOF) {
-		return DecodeResult{}, fmt.Errorf("%w: read rows %d..%d at offset %d: %v",
-			ErrInput, ch.StartRow, ch.StartRow+int64(ch.RowCount), ch.ByteOffset, err)
+	// ReadAt reports a short read as io.EOF, so check the byte count too: the
+	// file can be truncated or replaced after the up-front size check.
+	n, err := w.file.ReadAt(buf, ch.ByteOffset)
+	if err != nil && !(errors.Is(err, io.EOF) && n == size) {
+		return DecodeResult{}, fmt.Errorf("%w: read rows %d..%d at offset %d: read %d of %d bytes: %v",
+			ErrInput, ch.StartRow, ch.StartRow+int64(ch.RowCount), ch.ByteOffset, n, size, err)
+	}
+	if n != size {
+		return DecodeResult{}, fmt.Errorf("%w: read rows %d..%d at offset %d: got %d of %d bytes; "+
+			"the input was truncated or modified during conversion",
+			ErrInput, ch.StartRow, ch.StartRow+int64(ch.RowCount), ch.ByteOffset, n, size)
 	}
 
 	metrics := NewMetrics(w.c.Schema)

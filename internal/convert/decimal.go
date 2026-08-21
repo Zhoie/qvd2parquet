@@ -44,10 +44,22 @@ func decimalDigits(v *big.Int) int32 {
 	return int32(len(a.String()))
 }
 
-// ScaledFromText parses a display string into an integer scaled by 10^scale.
-// decSep is the declared decimal separator ("." when empty) and thouSep the
-// declared thousands separator, which is stripped when present.
+// ScaledFromText parses a display string into an integer scaled by 10^scale,
+// failing if the string carries more significant decimals than the scale
+// allows. decSep is the declared decimal separator ("." when empty) and
+// thouSep the declared thousands separator, which is stripped when present.
 func ScaledFromText(text string, scale int32, decSep, thouSep string) (*big.Int, error) {
+	return scaledFromText(text, scale, decSep, thouSep, false)
+}
+
+// ScaledFromTextRounded is ScaledFromText but rounds excess decimals
+// half-away-from-zero instead of failing. It is used when --decimal-strict is
+// disabled.
+func ScaledFromTextRounded(text string, scale int32, decSep, thouSep string) (*big.Int, error) {
+	return scaledFromText(text, scale, decSep, thouSep, true)
+}
+
+func scaledFromText(text string, scale int32, decSep, thouSep string, round bool) (*big.Int, error) {
 	s := strings.TrimSpace(text)
 	if s == "" {
 		return nil, fmt.Errorf("empty display string")
@@ -86,13 +98,18 @@ func ScaledFromText(text string, scale int32, decSep, thouSep string) (*big.Int,
 	if !allDigits(intPart) || !allDigits(fracPart) {
 		return nil, fmt.Errorf("%q is not a plain decimal number", text)
 	}
+	roundUp := false
 	if int32(len(fracPart)) > scale {
 		// More decimals than the declared scale: trailing zeros are harmless,
 		// significant digits are not.
 		extra := fracPart[scale:]
 		if strings.Trim(extra, "0") != "" {
-			return nil, fmt.Errorf("%w: %q has %d decimals, scale is %d",
-				ErrDecimalInexact, text, len(fracPart), scale)
+			if !round {
+				return nil, fmt.Errorf("%w: %q has %d decimals, scale is %d",
+					ErrDecimalInexact, text, len(fracPart), scale)
+			}
+			// Round half away from zero on the first dropped digit.
+			roundUp = extra[0] >= '5'
 		}
 		fracPart = fracPart[:scale]
 	}
@@ -102,6 +119,9 @@ func ScaledFromText(text string, scale int32, decSep, thouSep string) (*big.Int,
 	v, ok := new(big.Int).SetString(intPart+fracPart, 10)
 	if !ok {
 		return nil, fmt.Errorf("%q is not a plain decimal number", text)
+	}
+	if roundUp {
+		v.Add(v, big.NewInt(1))
 	}
 	if neg {
 		v.Neg(v)
@@ -121,6 +141,17 @@ func allDigits(s string) bool {
 // ScaledFromFloat converts a binary double to an integer scaled by 10^scale,
 // failing when the value carries more precision than the scale allows.
 func ScaledFromFloat(v float64, scale int32) (*big.Int, error) {
+	return scaledFromFloat(v, scale, false)
+}
+
+// ScaledFromFloatRounded is ScaledFromFloat but rounds a value carrying more
+// precision than the scale allows instead of failing. It is used when
+// --decimal-strict is disabled.
+func ScaledFromFloatRounded(v float64, scale int32) (*big.Int, error) {
+	return scaledFromFloat(v, scale, true)
+}
+
+func scaledFromFloat(v float64, scale int32, round bool) (*big.Int, error) {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return nil, fmt.Errorf("%w: %v is not finite", ErrDecimalInexact, v)
 	}
@@ -128,10 +159,10 @@ func ScaledFromFloat(v float64, scale int32) (*big.Int, error) {
 	if math.Abs(scaled) >= 1e18 {
 		// Beyond float64's exact integer range; go through the decimal text
 		// form, which is exact for any finite double.
-		return scaledFromFloatBig(v, scale)
+		return scaledFromFloatBig(v, scale, round)
 	}
 	rounded := math.Round(scaled)
-	if math.Abs(scaled-rounded) > decimalTolerance {
+	if !round && math.Abs(scaled-rounded) > decimalTolerance {
 		return nil, fmt.Errorf("%w: %v scaled by 10^%d is %v", ErrDecimalInexact, v, scale, scaled)
 	}
 	return big.NewInt(int64(rounded)), nil
@@ -139,7 +170,7 @@ func ScaledFromFloat(v float64, scale int32) (*big.Int, error) {
 
 // scaledFromFloatBig scales through big.Float, which represents any finite
 // double exactly.
-func scaledFromFloatBig(v float64, scale int32) (*big.Int, error) {
+func scaledFromFloatBig(v float64, scale int32, round bool) (*big.Int, error) {
 	bf := new(big.Float).SetPrec(200).SetFloat64(v)
 	bf.Mul(bf, new(big.Float).SetPrec(200).SetInt(pow10(scale)))
 	i, acc := bf.Int(nil)
@@ -158,6 +189,15 @@ func scaledFromFloatBig(v float64, scale int32) (*big.Int, error) {
 		}
 		return i.Sub(i, big.NewInt(1)), nil
 	}
+	if round {
+		if f >= 0.5 {
+			return i.Add(i, big.NewInt(1)), nil
+		}
+		if f <= -0.5 {
+			return i.Sub(i, big.NewInt(1)), nil
+		}
+		return i, nil
+	}
 	return nil, fmt.Errorf("%w: %v cannot be scaled by 10^%d exactly", ErrDecimalInexact, v, scale)
 }
 
@@ -174,6 +214,9 @@ type DecimalExtractor struct {
 	// for the schema report.
 	UsedText    bool
 	UsedNumeric bool
+	// Rounded counts values that had to be rounded to the declared scale,
+	// which is only possible when Strict is false.
+	Rounded int64
 }
 
 // Scaled converts one symbol. It returns (nil, nil) for a null symbol.
@@ -181,11 +224,24 @@ func (e *DecimalExtractor) Scaled(s qvd.Symbol) (*big.Int, error) {
 	if s.Kind == qvd.SymbolNull {
 		return nil, nil
 	}
+	// With --decimal-strict=false a value carrying more decimals than the
+	// declared scale is rounded to that scale. It is never dropped: silently
+	// turning an inexact value into a null would lose data, and no later check
+	// could recover it because the metrics describe the converted value.
 	tryText := func() (*big.Int, error) {
 		if !s.Kind.HasText() || strings.TrimSpace(s.Text) == "" {
 			return nil, fmt.Errorf("symbol has no display string")
 		}
-		return ScaledFromText(s.Text, e.Scale, e.DecSep, e.ThouSep)
+		if e.Strict {
+			return ScaledFromText(s.Text, e.Scale, e.DecSep, e.ThouSep)
+		}
+		v, err := ScaledFromTextRounded(s.Text, e.Scale, e.DecSep, e.ThouSep)
+		if err == nil {
+			if _, strict := ScaledFromText(s.Text, e.Scale, e.DecSep, e.ThouSep); strict != nil {
+				e.Rounded++
+			}
+		}
+		return v, err
 	}
 	tryNumeric := func() (*big.Int, error) {
 		n, ok := s.Numeric()
@@ -195,7 +251,16 @@ func (e *DecimalExtractor) Scaled(s qvd.Symbol) (*big.Int, error) {
 		if s.Kind == qvd.SymbolInt || s.Kind == qvd.SymbolDualIntString {
 			return new(big.Int).Mul(big.NewInt(s.Int), pow10(e.Scale)), nil
 		}
-		return ScaledFromFloat(n, e.Scale)
+		if e.Strict {
+			return ScaledFromFloat(n, e.Scale)
+		}
+		v, err := ScaledFromFloatRounded(n, e.Scale)
+		if err == nil {
+			if _, strict := ScaledFromFloat(n, e.Scale); strict != nil {
+				e.Rounded++
+			}
+		}
+		return v, err
 	}
 
 	switch e.Source {
@@ -273,11 +338,8 @@ func ResolveDecimalSpec(colName string, symbols []qvd.Symbol, ex *DecimalExtract
 	for i, s := range symbols {
 		v, err := ex.Scaled(s)
 		if err != nil {
-			if !ex.Strict && errors.Is(err, ErrDecimalInexact) {
-				continue
-			}
 			return DecimalSpec{}, nil, fmt.Errorf(
-				"column %q symbol %d (%v %q): %w; relax with --decimal-strict=false or pin the column with --schema",
+				"column %q symbol %d (%v %q): %w; relax with --decimal-strict=false to round to the declared scale, or pin the column with --schema",
 				colName, i, s.Kind, s.Text, err)
 		}
 		scaled[i] = v

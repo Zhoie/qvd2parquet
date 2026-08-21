@@ -41,7 +41,10 @@ a downloaded binary; clear it with
 
 ### From source
 
-Requires Go 1.25 or newer (`github.com/apache/arrow-go/v18` sets the floor).
+Requires Go 1.25 or newer. That floor comes from `github.com/apache/arrow-go/v18`;
+the `go` directive in `go.mod` is a minimum, not a pin, so the module also
+builds with 1.26 and 1.27. CI tests against both the 1.25 floor and the newest
+release, and release binaries are built with the newest toolchain.
 
 ```sh
 go install github.com/ralforion/qvd2parquet/cmd/qvd2parquet@latest
@@ -176,6 +179,10 @@ harmless, some are not:
 `--dual` selects which side of a Qlik dual is written: `numeric` (default),
 `text`, or `columns` for both. `--mixed=dual-columns` implies `--dual=columns`.
 
+Output column names must be unique. If a generated `${name}__text` column would
+collide with a real source column of that name, the conversion fails with a
+schema policy error rather than writing an ambiguous Parquet schema.
+
 The defaults — `--mixed=error --numeric-promote=true --dual=numeric
 --mixed-string-fallback=false` — stop an ETL job on unexpected schema drift
 while still handling the common `int + float` and dual-numeric cases.
@@ -197,6 +204,10 @@ scaled integers end to end, so no step of the pipeline rounds through a double.
   exact at the declared scale. The tolerance used when scaling a double is only
   large enough to absorb binary representation noise; it never accepts a value
   with more decimal places than the scale allows.
+- `--decimal-strict=false` **rounds** such a value to the declared scale, half
+  away from zero. It is never dropped: silently turning an inexact value into a
+  null would lose data that no later check could recover, since the quality
+  metrics describe the converted value.
 
 The schema report records the resolved precision and scale and whether the
 digits came from display strings, numeric payloads, or both.
@@ -214,8 +225,12 @@ digits came from display strings, numeric payloads, or both.
 
 Supported types: `string`, `int64`, `float64`, `date32`, `timestamp`, `time`,
 `decimal`. Overrides are validated against the actual symbols before anything is
-written, so pinning a column holding doubles to `int64` fails rather than
-silently truncating.
+written, so pinning a column holding doubles to `int64`, or a text column to
+`date32`, fails as a schema policy error (exit code 3) rather than silently
+truncating or failing part-way through the conversion.
+
+A pinned `timestamp` carries the run's `--timezone`, so its Parquet metadata
+always matches the timezone the values were converted with.
 
 ### Dates and times
 

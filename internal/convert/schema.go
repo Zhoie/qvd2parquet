@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/ralforion/qvd2parquet/internal/qvd"
@@ -142,13 +143,36 @@ func (so *SchemaOverride) lookup(name string) (ColumnOverride, bool) {
 	return ColumnOverride{}, false
 }
 
-// requireNumericSymbols rejects a date/time pin on a column holding text-only
-// symbols, which could not be converted.
-func requireNumericSymbols(col qvd.Column, syms []qvd.Symbol, pinned string) error {
+// requireConvertibleDateTime validates a date/time pin by running the same
+// conversion the decode workers will run, on every symbol. Checking only the
+// symbol kind would let NaN, an out-of-range serial day or an oversized
+// timestamp through schema resolution and fail mid-conversion instead.
+func requireConvertibleDateTime(col qvd.Column, syms []qvd.Symbol, pinned string, loc *time.Location) error {
+	reject := func(i int, s qvd.Symbol, why string) error {
+		return fmt.Errorf("%w: schema override pins %q to %s, but symbol %d (%v %q) %s",
+			ErrSchemaPolicy, col.Name, pinned, i, s.Kind, s.Text, why)
+	}
 	for i, s := range syms {
-		if s.Kind == qvd.SymbolString {
-			return fmt.Errorf("%w: schema override pins %q to %s, but symbol %d is the string %q "+
-				"and carries no numeric value", ErrSchemaPolicy, col.Name, pinned, i, s.Text)
+		if s.Kind == qvd.SymbolNull {
+			continue
+		}
+		n, ok := s.Numeric()
+		if !ok {
+			return reject(i, s, "carries no numeric value")
+		}
+		switch pinned {
+		case "date32":
+			if _, ok := qvd.QlikDaysToDate32(n); !ok {
+				return reject(i, s, fmt.Sprintf("has serial day %v, which is out of range for date32", n))
+			}
+		case "timestamp":
+			if _, ok := qvd.QlikDaysToTimestampMillis(n, loc); !ok {
+				return reject(i, s, fmt.Sprintf("has serial timestamp %v, which is out of range", n))
+			}
+		case "time":
+			if _, ok := qvd.QlikFractionToTimeMillis(n); !ok {
+				return reject(i, s, fmt.Sprintf("has time value %v, which is out of range", n))
+			}
 		}
 	}
 	return nil
@@ -232,7 +256,7 @@ func resolveColumn(col qvd.Column, prof *qvd.ColumnProfile, syms []qvd.Symbol,
 	// An explicit override wins over inference, but is still validated against
 	// the symbols actually present.
 	if co, ok := override.lookup(col.Name); ok {
-		rc, err := applyOverride(base, co, col, syms, tsType)
+		rc, err := applyOverride(base, co, col, syms, tsType, opts.Location)
 		if err != nil {
 			return nil, "", err
 		}
@@ -411,7 +435,7 @@ func resolveDecimalColumn(base ResolvedColumn, col qvd.Column, syms []qvd.Symbol
 // an impossible pin fails as a schema policy error before anything is written
 // rather than as a decode error mid-conversion.
 func applyOverride(base ResolvedColumn, co ColumnOverride, col qvd.Column,
-	syms []qvd.Symbol, tsType arrow.DataType) (ResolvedColumn, error) {
+	syms []qvd.Symbol, tsType arrow.DataType, loc *time.Location) (ResolvedColumn, error) {
 	switch strings.ToLower(co.Type) {
 	case "string":
 		base.ArrowType, base.Strategy = arrowString, StrategyString
@@ -439,19 +463,19 @@ func applyOverride(base ResolvedColumn, co ColumnOverride, col qvd.Column,
 		}
 		base.ArrowType, base.Strategy = arrowF64, StrategyFloat64
 	case "date32":
-		if err := requireNumericSymbols(col, syms, "date32"); err != nil {
+		if err := requireConvertibleDateTime(col, syms, "date32", loc); err != nil {
 			return base, err
 		}
 		base.ArrowType, base.Strategy = arrowDate32, StrategyDate32
 	case "timestamp":
-		if err := requireNumericSymbols(col, syms, "timestamp"); err != nil {
+		if err := requireConvertibleDateTime(col, syms, "timestamp", loc); err != nil {
 			return base, err
 		}
 		// Use the run's configured timezone, so the type metadata matches how
 		// the values are actually converted.
 		base.ArrowType, base.Strategy = tsType, StrategyTimestampMillis
 	case "time":
-		if err := requireNumericSymbols(col, syms, "time"); err != nil {
+		if err := requireConvertibleDateTime(col, syms, "time", loc); err != nil {
 			return base, err
 		}
 		base.ArrowType, base.Strategy = arrowTime32, StrategyTimeMillis

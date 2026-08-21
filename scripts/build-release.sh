@@ -16,7 +16,8 @@ cd "$(dirname "$0")/.."
 
 BINARY=qvd2parquet
 DIST=${DIST:-dist}
-VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
+# Prefer an exact tag, then a tag-derived description, then the baseline.
+VERSION=${VERSION:-$(git describe --tags --dirty 2>/dev/null || echo v0.1.0)}
 
 # Every platform verified to compile. All are pure Go.
 DEFAULT_PLATFORMS="

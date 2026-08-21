@@ -27,17 +27,31 @@ const (
 	exitQuality     = 6
 )
 
-var version = "dev"
+// Program identity. version is overridden at build time with
+// -ldflags "-X main.version=..."; scripts/build-release.sh does this.
+const (
+	programName = "qvd2parquet"
+	copyright   = "(c) RALFORION d.o.o."
+)
+
+var version = "0.1.0"
+
+// banner is the identification line printed at startup. It goes to stderr so
+// it never contaminates piped output.
+func banner() string {
+	return fmt.Sprintf("%s %s  %s", programName, version, copyright)
+}
 
 func main() {
 	os.Exit(run())
 }
 
 func run() int {
-	fs := flag.NewFlagSet("qvd2parquet", flag.ContinueOnError)
+	fs := flag.NewFlagSet(programName, flag.ContinueOnError)
 	fs.Usage = func() {
 		out := fs.Output()
-		fmt.Fprintf(out, "qvd2parquet %s - convert Qlik QVD files to Parquet\n\n", version)
+		fmt.Fprintf(out, "%s\n", banner())
+		fmt.Fprintf(out, "Convert Qlik QVD files to Parquet.\n\n")
 		fmt.Fprintf(out, "Usage:\n  qvd2parquet [options] input.qvd output.parquet\n\n")
 		fmt.Fprintf(out, "Options:\n")
 		fs.PrintDefaults()
@@ -83,11 +97,12 @@ func run() int {
 		return exitUsage
 	}
 	if *showVersion {
-		fmt.Println(version)
+		fmt.Println(banner())
 		return exitOK
 	}
 	if fs.NArg() != 2 {
-		fmt.Fprintf(os.Stderr, "qvd2parquet: expected an input and an output path, got %d argument(s)\n\n", fs.NArg())
+		fmt.Fprintf(os.Stderr, "%s: expected an input and an output path, got %d argument(s)\n\n",
+			programName, fs.NArg())
 		fs.Usage()
 		return exitUsage
 	}
@@ -151,13 +166,15 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	fmt.Fprintln(os.Stderr, banner())
+
 	logf := func(format string, args ...any) {
-		fmt.Fprintf(os.Stderr, "qvd2parquet: "+format+"\n", args...)
+		fmt.Fprintf(os.Stderr, programName+": "+format+"\n", args...)
 	}
 
 	stats, _, err := convert.Run(ctx, inputPath, outputPath, &opts, logf)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "qvd2parquet: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
 		return exitCodeFor(err)
 	}
 
@@ -179,7 +196,7 @@ func fsSet(fs *flag.FlagSet, name string) bool {
 }
 
 func usageErr(err error) int {
-	fmt.Fprintf(os.Stderr, "qvd2parquet: %v\n", err)
+	fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
 	return exitUsage
 }
 

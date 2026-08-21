@@ -3,6 +3,7 @@ package convert
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -238,5 +239,86 @@ func TestShortReadIsReported(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bytes") {
 		t.Errorf("error should report the short read: %v", err)
+	}
+}
+
+// A date/time override must be validated by running the real conversion, not
+// just by checking the symbol kind. NaN and out-of-range serials are numeric
+// but still unconvertible, and must fail at schema resolution.
+func TestDateTimeOverridesRejectUnconvertibleNumerics(t *testing.T) {
+	tests := []struct {
+		name   string
+		pinned string
+		sym    qvd.Symbol
+	}{
+		{"NaN date", "date32", qvdtest.Float(math.NaN())},
+		{"NaN timestamp", "timestamp", qvdtest.Float(math.NaN())},
+		{"NaN time", "time", qvdtest.Float(math.NaN())},
+		{"huge serial day", "date32", qvdtest.Float(1e30)},
+		{"huge timestamp", "timestamp", qvdtest.Float(1e30)},
+		{"infinite time", "time", qvdtest.Float(math.Inf(1))},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "t.qvd")
+			fld := qvdtest.Field{Name: "V", Type: "REAL",
+				Symbols: []qvd.Symbol{qvdtest.Float(45000), tc.sym}, Rows: []int{0, 1}}
+			if _, err := qvdtest.Build(path, qvdtest.Table{Name: "T", Fields: []qvdtest.Field{fld}}); err != nil {
+				t.Fatal(err)
+			}
+			qf, err := qvd.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer qf.Close()
+			if err := qf.ReadSymbols(qvd.UnknownSymbolError); err != nil {
+				t.Fatal(err)
+			}
+			opts := DefaultOptions()
+			opts.Location = utc()
+			if err := opts.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			override := &SchemaOverride{Columns: map[string]ColumnOverride{"V": {Type: tc.pinned}}}
+			_, err = ResolveSchema(qf, &opts, override)
+			if !errors.Is(err, ErrSchemaPolicy) {
+				t.Fatalf("pinning %s to %s gave %v, want ErrSchemaPolicy at schema resolution",
+					tc.name, tc.pinned, err)
+			}
+			if !strings.Contains(err.Error(), "V") {
+				t.Errorf("error should name the column: %v", err)
+			}
+		})
+	}
+}
+
+// A valid date/time override still resolves, and nulls are skipped.
+func TestDateTimeOverrideAcceptsConvertibleValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.qvd")
+	fld := qvdtest.Field{Name: "D", Type: "REAL",
+		Symbols: []qvd.Symbol{qvdtest.Float(45000.5), qvdtest.Null()}, Rows: []int{0, -1}}
+	if _, err := qvdtest.Build(path, qvdtest.Table{Name: "T", Fields: []qvdtest.Field{fld}}); err != nil {
+		t.Fatal(err)
+	}
+	qf, err := qvd.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer qf.Close()
+	if err := qf.ReadSymbols(qvd.UnknownSymbolError); err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultOptions()
+	opts.Location = utc()
+	if err := opts.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	override := &SchemaOverride{Columns: map[string]ColumnOverride{"D": {Type: "date32"}}}
+	rs, err := ResolveSchema(qf, &opts, override)
+	if err != nil {
+		t.Fatalf("a convertible date column should resolve: %v", err)
+	}
+	if rs.Columns[0].Strategy != StrategyDate32 {
+		t.Errorf("strategy = %v, want StrategyDate32", rs.Columns[0].Strategy)
 	}
 }

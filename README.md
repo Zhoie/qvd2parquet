@@ -95,7 +95,36 @@ qvd2parquet [options] input.qvd output.parquet
   -strict                    Enable strict validation defaults
 ```
 
-Progress and diagnostics go to stderr, never stdout.
+### Output
+
+The conversion writes the Parquet file; everything else — the identification
+banner, the per-column schema decisions, progress and the final summary — goes
+to **stderr**. **stdout stays empty**, so `qvd2parquet` composes safely in
+pipelines and shell substitutions.
+
+```text
+$ qvd2parquet --timezone UTC --quality-gate numeric sales.qvd sales.parquet
+qvd2parquet 0.1.0  (c) RALFORION d.o.o.
+qvd2parquet: sales.qvd: table "products", 77 rows, 7 bytes/record, 9 of 9 columns selected
+qvd2parquet: read 412 symbols in 1ms; records start at offset 8973
+qvd2parquet: schema: Einkaufspreis: REAL with 75 double symbols, written as float64
+qvd2parquet: schema: Produktname: 77 text symbols, written as utf8
+qvd2parquet: schema: Listenpreis: 25 integer and 35 double symbols promoted to float64
+qvd2parquet: converted 77/77 rows in 2ms (42445 rows/s)
+qvd2parquet: quality gate numeric finished in 1ms: passed
+qvd2parquet: wrote sales.parquet: 77 rows, 9 columns, 4.9 KiB in 12ms (6227 rows/s)
+```
+
+One `schema:` line is printed per output column, explaining exactly why each
+type was chosen. That is the first thing to read when a mixed-type column
+fails; `--schema-report` writes the same reasoning as JSON.
+
+Print the version and exit with `--version`:
+
+```text
+$ qvd2parquet --version
+qvd2parquet 0.1.0  (c) RALFORION d.o.o.
+```
 
 ### Examples
 

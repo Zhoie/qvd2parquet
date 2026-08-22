@@ -31,8 +31,8 @@ const (
 	StrategyFloat64
 	// StrategyDate32 writes days since the Unix epoch.
 	StrategyDate32
-	// StrategyTimestampMillis writes milliseconds since the Unix epoch.
-	StrategyTimestampMillis
+	// StrategyTimestampMicros writes microseconds since the Unix epoch.
+	StrategyTimestampMicros
 	// StrategyTimeMillis writes milliseconds since midnight.
 	StrategyTimeMillis
 	// StrategyDecimal writes an exact scaled decimal.
@@ -44,7 +44,7 @@ const (
 func (s ValueStrategy) String() string {
 	return [...]string{
 		"StrategyNull", "StrategyString", "StrategyInt64", "StrategyFloat64",
-		"StrategyDate32", "StrategyTimestampMillis", "StrategyTimeMillis",
+		"StrategyDate32", "StrategyTimestampMicros", "StrategyTimeMillis",
 		"StrategyDecimal", "StrategyDualText",
 	}[s]
 }
@@ -52,7 +52,7 @@ func (s ValueStrategy) String() string {
 // IsNumericAggregatable reports whether numeric quality metrics apply.
 func (s ValueStrategy) IsNumericAggregatable() bool {
 	switch s {
-	case StrategyInt64, StrategyFloat64, StrategyDate32, StrategyTimestampMillis,
+	case StrategyInt64, StrategyFloat64, StrategyDate32, StrategyTimestampMicros,
 		StrategyTimeMillis, StrategyDecimal:
 		return true
 	}
@@ -163,47 +163,65 @@ func (so *SchemaOverride) lookup(name string) (ColumnOverride, bool) {
 // conversion the decode workers will run, on every symbol. Checking only the
 // symbol kind would let NaN, an out-of-range serial day or an oversized
 // timestamp through schema resolution and fail mid-conversion instead.
+// dateTimeScan carries what validating a date/time pin observed, so the caller
+// can report it alongside the resolved type.
+type dateTimeScan struct {
+	// NonFinite counts NaN and infinity, which are written as null.
+	NonFinite int64
+	// Relocated counts wall clocks the timezone never had, which a zoned
+	// conversion moves. Ambiguous counts wall clocks it had twice, where one
+	// of the two instants was picked. Both stay zero for UTC and for --timezone=none.
+	Relocated int64
+	Ambiguous int64
+}
+
 func requireConvertibleDateTime(col qvd.Column, syms []qvd.Symbol, pinned string,
-	loc *time.Location, emptyAsNull bool) (int64, error) {
+	loc *time.Location, emptyAsNull bool) (dateTimeScan, error) {
 	// The type may come from the header, a Qlik tag, inference or --schema, so
 	// state what was resolved rather than assuming an override.
 	reject := func(i int, s qvd.Symbol, why string) error {
 		return fmt.Errorf("%w: column %q resolves to %s, but symbol %d (%v %q) %s",
 			ErrSchemaPolicy, col.Name, pinned, i, s.Kind, s.Text, why)
 	}
-	var nonFinite int64
+	var scan dateTimeScan
 	for i, s := range syms {
 		if symbolIsAbsent(s, emptyAsNull) {
 			continue
 		}
 		n, ok := s.Numeric()
 		if !ok {
-			return 0, reject(i, s, "carries no numeric value")
+			return scan, reject(i, s, "carries no numeric value")
 		}
 		// NaN and infinity are not values that a date can hold, and nothing is
 		// lost by writing them as null. A finite value that simply does not fit
 		// is different: nulling it would discard real data, so that still
 		// fails.
 		if isNonFinite(n) {
-			nonFinite++
+			scan.NonFinite++
 			continue
 		}
 		switch pinned {
 		case "date32":
 			if _, ok := qvd.QlikDaysToDate32(n); !ok {
-				return 0, reject(i, s, fmt.Sprintf("has serial day %v, which is out of range for date32", n))
+				return scan, reject(i, s, fmt.Sprintf("has serial day %v, which is out of range for date32", n))
 			}
 		case "timestamp":
-			if _, ok := qvd.QlikDaysToTimestampMillis(n, loc); !ok {
-				return 0, reject(i, s, fmt.Sprintf("has serial timestamp %v, which is out of range", n))
+			if _, ok := qvd.QlikDaysToTimestampMicros(n, loc); !ok {
+				return scan, reject(i, s, fmt.Sprintf("has serial timestamp %v, which is out of range", n))
+			}
+			switch qvd.TimestampZoneAnomaly(n, loc) {
+			case qvd.ZoneRelocated:
+				scan.Relocated++
+			case qvd.ZoneAmbiguous:
+				scan.Ambiguous++
 			}
 		case "time":
 			if _, ok := qvd.QlikFractionToTimeMillis(n); !ok {
-				return 0, reject(i, s, fmt.Sprintf("has time value %v, which is out of range", n))
+				return scan, reject(i, s, fmt.Sprintf("has time value %v, which is out of range", n))
 			}
 		}
 	}
-	return nonFinite, nil
+	return scan, nil
 }
 
 // symbolIsAbsent reports whether a symbol carries no value for conversion
@@ -232,7 +250,7 @@ var (
 // ResolveSchema turns profiled QVD columns into the output Parquet schema.
 func ResolveSchema(f *qvd.File, opts *Options, override *SchemaOverride) (*ResolvedSchema, error) {
 	rs := &ResolvedSchema{}
-	tsType := &arrow.TimestampType{Unit: arrow.Millisecond, TimeZone: arrowTimeZoneName(opts)}
+	tsType := &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: arrowTimeZoneName(opts)}
 
 	for _, idx := range f.SelectedColumns() {
 		col := f.Columns[idx]
@@ -305,13 +323,37 @@ func checkNameCollisions(cols []ResolvedColumn) error {
 	return nil
 }
 
-// arrowTimeZoneName is the timezone stamped into the Arrow timestamp type so
-// downstream readers interpret the stored UTC milliseconds correctly.
+// arrowTimeZoneName is the timezone stamped into the Arrow timestamp type.
+//
+// An empty name is not a missing value: it makes the column a naive wall clock
+// (Parquet isAdjustedToUTC=false), which is what a QVD actually stores. That is
+// what --timezone=none asks for.
+//
+// Every other mode names UTC, whatever zone was given. --timezone states which
+// zone the *input* wall clocks were recorded in, not how to label the output:
+// once they are placed on the timeline the stored value is a UTC instant, so
+// UTC is what the type should say. Stamping the source zone instead would make
+// Arrow readers render the values back in it while every engine reading the
+// Parquet type alone -- which carries isAdjustedToUTC and no name -- rendered
+// the instant, so identical bytes would show two different times.
 func arrowTimeZoneName(opts *Options) string {
-	if opts.Location == nil {
-		return "UTC"
+	if opts.NaiveTimestamps {
+		return ""
 	}
-	return opts.Location.String()
+	return "UTC"
+}
+
+// timestampTypeLabel renders a timestamp type the way the schema notes and the
+// --inspect output name it.
+func timestampTypeLabel(t arrow.DataType) string {
+	ts, ok := t.(*arrow.TimestampType)
+	if !ok {
+		return t.String()
+	}
+	if ts.TimeZone == "" {
+		return "timestamp[us]"
+	}
+	return fmt.Sprintf("timestamp[us, tz=%s]", ts.TimeZone)
 }
 
 // resolveColumn decides the output column(s) for one QVD field. It returns one
@@ -333,11 +375,12 @@ func resolveColumn(col qvd.Column, prof *qvd.ColumnProfile, syms []qvd.Symbol,
 	// An explicit override wins over inference, but is still validated against
 	// the symbols actually present.
 	if co, ok := override.lookup(col.Name); ok {
-		rc, err := applyOverride(base, co, col, syms, tsType, opts.Location, opts.EmptyStringAsNull)
+		rc, scan, err := applyOverride(base, co, col, syms, tsType, opts.Location, opts.EmptyStringAsNull)
 		if err != nil {
 			return nil, "", err
 		}
-		return []ResolvedColumn{rc}, fmt.Sprintf("%s: pinned to %s by --schema", col.Name, rc.ArrowType), nil
+		return []ResolvedColumn{rc}, withNonFiniteNote(
+			fmt.Sprintf("%s: pinned to %s by --schema", col.Name, rc.ArrowType), scan), nil
 	}
 
 	if prof.HasOnlyNulls() {
@@ -458,34 +501,34 @@ func resolveNumericColumn(base ResolvedColumn, col qvd.Column, prof *qvd.ColumnP
 
 	switch qlikType {
 	case qvd.QlikDate:
-		nonFinite, err := requireConvertibleDateTime(col, syms, "date32", opts.Location, opts.EmptyStringAsNull)
+		scan, err := requireConvertibleDateTime(col, syms, "date32", opts.Location, opts.EmptyStringAsNull)
 		if err != nil {
 			return ResolvedColumn{}, "", err
 		}
-		base.NonFiniteNulls = nonFinite
+		base.NonFiniteNulls = scan.NonFinite
 		base.ArrowType, base.Strategy = arrowDate32, StrategyDate32
 		return base, withNonFiniteNote(withInferNote(
-			fmt.Sprintf("%s: DATE, written as date32 (days since epoch)", col.Name), inferNote), nonFinite), nil
+			fmt.Sprintf("%s: DATE, written as date32 (days since epoch)", col.Name), inferNote), scan), nil
 
 	case qvd.QlikTimestamp:
-		nonFinite, err := requireConvertibleDateTime(col, syms, "timestamp", opts.Location, opts.EmptyStringAsNull)
+		scan, err := requireConvertibleDateTime(col, syms, "timestamp", opts.Location, opts.EmptyStringAsNull)
 		if err != nil {
 			return ResolvedColumn{}, "", err
 		}
-		base.NonFiniteNulls = nonFinite
-		base.ArrowType, base.Strategy = tsType, StrategyTimestampMillis
-		return base, withNonFiniteNote(withInferNote(fmt.Sprintf("%s: TIMESTAMP, written as timestamp[ms, tz=%s]",
-			col.Name, tsType.(*arrow.TimestampType).TimeZone), inferNote), nonFinite), nil
+		base.NonFiniteNulls = scan.NonFinite
+		base.ArrowType, base.Strategy = tsType, StrategyTimestampMicros
+		return base, withNonFiniteNote(withInferNote(fmt.Sprintf("%s: TIMESTAMP, written as %s",
+			col.Name, timestampTypeLabel(tsType)), inferNote), scan), nil
 
 	case qvd.QlikTime:
-		nonFinite, err := requireConvertibleDateTime(col, syms, "time", opts.Location, opts.EmptyStringAsNull)
+		scan, err := requireConvertibleDateTime(col, syms, "time", opts.Location, opts.EmptyStringAsNull)
 		if err != nil {
 			return ResolvedColumn{}, "", err
 		}
-		base.NonFiniteNulls = nonFinite
+		base.NonFiniteNulls = scan.NonFinite
 		base.ArrowType, base.Strategy = arrowTime32, StrategyTimeMillis
 		return base, withNonFiniteNote(withInferNote(
-			fmt.Sprintf("%s: TIME, written as time32[ms] (milliseconds since midnight)", col.Name), inferNote), nonFinite), nil
+			fmt.Sprintf("%s: TIME, written as time32[ms] (milliseconds since midnight)", col.Name), inferNote), scan), nil
 
 	case qvd.QlikFix, qvd.QlikMoney:
 		return resolveDecimalColumn(base, col, syms, opts)
@@ -541,11 +584,27 @@ func withInferNote(note, infer string) string {
 
 // withNonFiniteNote records values written as null because they are NaN or
 // infinite, so the substitution is reported rather than silent.
-func withNonFiniteNote(note string, n int64) string {
-	if n == 0 {
-		return note
+func withNonFiniteNote(note string, scan dateTimeScan) string {
+	if scan.NonFinite > 0 {
+		note += fmt.Sprintf("; %d non-finite value(s) written as null", scan.NonFinite)
 	}
-	return note + fmt.Sprintf("; %d non-finite value(s) written as null", n)
+	return withZoneNote(note, scan)
+}
+
+// withZoneNote reports where a zoned conversion had to alter a wall clock. A
+// QVD stores a naive reading, so this is the converter changing data on the
+// strength of the --timezone claim, and it should never be silent.
+func withZoneNote(note string, scan dateTimeScan) string {
+	if scan.Relocated > 0 {
+		note += fmt.Sprintf("; %d wall clock(s) do not exist in this timezone (a DST change skips them) and were moved", scan.Relocated)
+	}
+	if scan.Ambiguous > 0 {
+		note += fmt.Sprintf("; %d wall clock(s) occur twice in this timezone (a DST change repeats them) and one instant was chosen", scan.Ambiguous)
+	}
+	if scan.Relocated > 0 || scan.Ambiguous > 0 {
+		note += "; --timezone=none writes the wall clock unchanged"
+	}
+	return note
 }
 
 // resolvePromotedDecimalColumn resolves a REAL-ish column to an exact decimal
@@ -675,7 +734,11 @@ func resolveDecimalColumn(base ResolvedColumn, col qvd.Column, syms []qvd.Symbol
 // an impossible pin fails as a schema policy error before anything is written
 // rather than as a decode error mid-conversion.
 func applyOverride(base ResolvedColumn, co ColumnOverride, col qvd.Column,
-	syms []qvd.Symbol, tsType arrow.DataType, loc *time.Location, emptyAsNull bool) (ResolvedColumn, error) {
+	syms []qvd.Symbol, tsType arrow.DataType, loc *time.Location, emptyAsNull bool) (ResolvedColumn, dateTimeScan, error) {
+	// Carried out so the caller can report the same conversion caveats a
+	// non-overridden column reports; a pinned timestamp relocates wall clocks
+	// across a DST discontinuity exactly like an inferred one.
+	var outScan dateTimeScan
 	switch strings.ToLower(co.Type) {
 	case "string":
 		base.ArrowType, base.Strategy = arrowString, StrategyString
@@ -685,11 +748,11 @@ func applyOverride(base ResolvedColumn, co ColumnOverride, col qvd.Column,
 				continue
 			}
 			if s.Kind == qvd.SymbolFloat || s.Kind == qvd.SymbolDualFloatString {
-				return base, fmt.Errorf("%w: schema override pins %q to int64, but symbol %d is a double (%v)",
+				return base, outScan, fmt.Errorf("%w: schema override pins %q to int64, but symbol %d is a double (%v)",
 					ErrSchemaPolicy, col.Name, i, s.Float)
 			}
 			if s.Kind == qvd.SymbolString {
-				return base, fmt.Errorf("%w: schema override pins %q to int64, but symbol %d is the string %q",
+				return base, outScan, fmt.Errorf("%w: schema override pins %q to int64, but symbol %d is the string %q",
 					ErrSchemaPolicy, col.Name, i, s.Text)
 			}
 		}
@@ -700,33 +763,33 @@ func applyOverride(base ResolvedColumn, co ColumnOverride, col qvd.Column,
 				continue
 			}
 			if s.Kind == qvd.SymbolString {
-				return base, fmt.Errorf("%w: schema override pins %q to float64, but symbol %d is the string %q",
+				return base, outScan, fmt.Errorf("%w: schema override pins %q to float64, but symbol %d is the string %q",
 					ErrSchemaPolicy, col.Name, i, s.Text)
 			}
 		}
 		base.ArrowType, base.Strategy = arrowF64, StrategyFloat64
 	case "date32":
-		nonFinite, err := requireConvertibleDateTime(col, syms, "date32", loc, emptyAsNull)
+		scan, err := requireConvertibleDateTime(col, syms, "date32", loc, emptyAsNull)
 		if err != nil {
-			return base, err
+			return base, outScan, err
 		}
-		base.NonFiniteNulls = nonFinite
+		base.NonFiniteNulls, outScan = scan.NonFinite, scan
 		base.ArrowType, base.Strategy = arrowDate32, StrategyDate32
 	case "timestamp":
-		nonFinite, err := requireConvertibleDateTime(col, syms, "timestamp", loc, emptyAsNull)
+		scan, err := requireConvertibleDateTime(col, syms, "timestamp", loc, emptyAsNull)
 		if err != nil {
-			return base, err
+			return base, outScan, err
 		}
-		base.NonFiniteNulls = nonFinite
+		base.NonFiniteNulls, outScan = scan.NonFinite, scan
 		// Use the run's configured timezone, so the type metadata matches how
 		// the values are actually converted.
-		base.ArrowType, base.Strategy = tsType, StrategyTimestampMillis
+		base.ArrowType, base.Strategy = tsType, StrategyTimestampMicros
 	case "time":
-		nonFinite, err := requireConvertibleDateTime(col, syms, "time", loc, emptyAsNull)
+		scan, err := requireConvertibleDateTime(col, syms, "time", loc, emptyAsNull)
 		if err != nil {
-			return base, err
+			return base, outScan, err
 		}
-		base.NonFiniteNulls = nonFinite
+		base.NonFiniteNulls, outScan = scan.NonFinite, scan
 		base.ArrowType, base.Strategy = arrowTime32, StrategyTimeMillis
 	case "decimal":
 		ex := &DecimalExtractor{
@@ -739,10 +802,10 @@ func applyOverride(base ResolvedColumn, co ColumnOverride, col qvd.Column,
 		}
 		spec, scaled, err := ResolveDecimalSpec(col.Name, syms, ex)
 		if err != nil {
-			return base, fmt.Errorf("%w: %s", ErrSchemaPolicy, err)
+			return base, outScan, fmt.Errorf("%w: %s", ErrSchemaPolicy, err)
 		}
 		if spec.Precision > co.Precision {
-			return base, fmt.Errorf("%w: schema override pins %q to decimal(%d,%d), but the data needs precision %d",
+			return base, outScan, fmt.Errorf("%w: schema override pins %q to decimal(%d,%d), but the data needs precision %d",
 				ErrSchemaPolicy, col.Name, co.Precision, co.Scale, spec.Precision)
 		}
 		spec.Precision = co.Precision
@@ -750,5 +813,5 @@ func applyOverride(base ResolvedColumn, co ColumnOverride, col qvd.Column,
 		base.Strategy, base.Decimal, base.Scaled = StrategyDecimal, spec, scaled
 		base.DecimalFromText, base.DecimalFromNumeric = ex.UsedText, ex.UsedNumeric
 	}
-	return base, nil
+	return base, outScan, nil
 }

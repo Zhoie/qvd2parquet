@@ -100,7 +100,7 @@ qvd2parquet --inspect [options] input.qvd
   -compression zstd          Parquet compression: zstd|snappy|gzip|uncompressed
   -batch-rows 65536          Rows per Arrow batch and Parquet row group
   -workers 0                 Decode workers, 0 means runtime.NumCPU()
-  -timezone Local            Local|UTC|IANA timezone name
+  -timezone none             none|Local|UTC|IANA timezone name
   -schema path.json          Explicit schema override
   -schema-report path.json   Write the inferred schema/profile report
   -quality-gate none         Validation mode: none|basic|numeric|full
@@ -390,7 +390,7 @@ producing an unstable schema that depends on which rows were seen first.
 | `REAL` with double symbols | `decimal128(p, s)`, scale inferred from the values; `float64` if no exact scale exists |
 | `MONEY`, `FIX` | `decimal128(p, s)` — never `float64` |
 | `DATE` | `date32` (days since the Unix epoch) |
-| `TIMESTAMP` | `timestamp[ms, tz=<--timezone>]` |
+| `TIMESTAMP` | `timestamp[us]`, or `timestamp[us, tz=UTC]` when `--timezone` names a zone |
 | `TIME` | `time32[ms]` (milliseconds since midnight) |
 | `ASCII` or text-only symbols | `utf8` |
 | all-null column | nullable `utf8` |
@@ -474,7 +474,7 @@ resolved to that type:
 
 ```text
 schema: OrderDate: DATE, written as date32 (days since epoch); no declared type, but tagged $date
-schema: Created: TIMESTAMP, written as timestamp[ms, tz=UTC]; no declared type, but tagged $timestamp
+schema: Created: TIMESTAMP, written as timestamp[us]; no declared type, but tagged $timestamp
 ```
 
 This is the most reliable signal, and the only one that works for a **plain
@@ -489,7 +489,7 @@ fallback: a column with no declared type is read as a date or timestamp when
 **every** display string renders its Excel-style serial value as one:
 
 ```text
-schema: Date: TIMESTAMP, written as timestamp[ms, tz=UTC]; no declared type, but all 18 display strings render their value as a timestamp (e.g. "11/20/2010"), so it is read as one
+schema: Date: TIMESTAMP, written as timestamp[us]; no declared type, but all 18 display strings render their value as a timestamp (e.g. "11/20/2010"), so it is read as one
 ```
 
 The check is format-agnostic: it converts the serial to a date and requires
@@ -603,22 +603,121 @@ written, so pinning a column holding doubles to `int64`, or a text column to
 `date32`, fails as a schema policy error (exit code 3) rather than silently
 truncating or failing part-way through the conversion.
 
-A pinned `timestamp` carries the run's `--timezone`, so its Parquet metadata
-always matches the timezone the values were converted with.
+A pinned `timestamp` is converted with the run's `--timezone` and typed like
+any other timestamp: `timestamp[us]` by default, `timestamp[us, tz=UTC]` when a
+zone is named. It reports the same conversion caveats too, so a pin that
+relocates a wall clock across a DST discontinuity says so rather than doing it
+quietly.
 
 ### Dates and times
 
 Qlik stores dates and times as serial day numbers where `25569` is
-1970-01-01. `--timezone` decides how a serial timestamp's wall-clock reading is
-mapped onto an instant:
+1970-01-01. A serial names no timezone: it is a bare wall-clock reading, and
+Qlik's own display string for a dual is a pure formatting of the same number
+with no zone step. Which zone that wall clock was recorded in is simply not in
+the file.
 
-- `Local` (default) matches the Java reference reader's behaviour.
-- `UTC` is recommended for reproducible ETL, since the output no longer depends
-  on the machine's timezone.
-- Any IANA name (`Europe/Berlin`) also works.
+`--timezone` therefore does not change the wall clock -- every mode writes back
+the same calendar and clock fields, with one exception noted below. What it
+decides is which *instant* those fields denote, and so which number lands in
+the file:
 
-`date32` and `time32[ms]` are timezone independent. Rounding follows the Java
-reference reader's `Math.round`.
+- `none` (default) writes the wall clock as-is, with no timezone on the column
+  (Parquet `isAdjustedToUTC=false`). It asserts nothing the QVD does not say,
+  and the output is byte-identical whatever machine converts it. Nothing is
+  converted unless you ask for it.
+- Any IANA name (`Europe/Berlin`) asserts that the wall clocks were recorded in
+  that zone and converts them to true instants. This is the mode that earns its
+  keep for Parquet: the instant is what makes ordering across a DST change,
+  joins against other instant data, and rendering in a consumer's own zone come
+  out right. Losing the *name* costs nothing, since an instant is unambiguous
+  without it.
+- `UTC` is the same assertion for UTC. It stores the identical bytes as `none`
+  and differs only in claiming instant semantics.
+- `Local` is `UTC`'s assertion made with whatever zone the converting machine
+  happens to be in, and matches the Java reference reader. It is the one mode
+  whose output depends on where it ran, so it is no longer the default.
+
+The exception is a DST discontinuity. A zoned mode has to place the wall clock
+on the timeline, and twice a year some wall clocks do not sit there cleanly:
+`2023-03-26 02:30` never happens in `Europe/Berlin`, so it is written as
+`03:30`, and `2023-10-29 02:30` happens twice, so one of the two instants is
+picked. `none` has no such edge, because it never places the reading on a
+timeline at all.
+
+Both sides of that discontinuity turn up in real data, so both matter.
+
+Timestamps recorded by a device following the local clock skip the missing
+hour. The Chicago taxi QVDs show it: on 13 March 2016 the data runs 01:45, then
+03:00, with the 02:00 hour absent because the local clock skipped it.
+
+    01:45   1035 trips
+    03:00   1049 trips
+
+That also settles what those values are -- local readings, not UTC, since a UTC
+series would have no gap.
+
+Plenty of local-time data does contain the missing hour, though. Generated
+master calendars enumerate every slot whether the zone had it or not, scheduled
+and derived timestamps are computed in local terms, and extracts from systems
+that do not observe DST write wall clocks the target zone never had. A zoned
+conversion silently relocates every one of those, and an ambiguous reading from
+the repeated hour is resolved by picking one of the two instants.
+
+That is the argument for `none` being the safe choice. Converting these
+readings to instants is only correct with the zone the source actually used --
+`America/Chicago` for the taxi data, which nothing in the QVD says, and whose
+offset is not even constant across a single file. Choosing a zone is a claim
+about provenance that only the person running the conversion can make, and
+`Local` makes it accidentally, using whatever zone the converting machine sits
+in.
+
+`--timezone` names the zone the *input* wall clocks were recorded in. It is not
+a label for the output: every mode but `none` writes `tz=UTC`, because once the
+readings are on the timeline what is stored is a UTC instant.
+
+    --timezone=none              timestamp[us]            2016-03-01 00:00:00
+    --timezone=UTC               timestamp[us, tz=UTC]    2016-03-01 00:00:00Z
+    --timezone=America/Chicago   timestamp[us, tz=UTC]    2016-03-01 06:00:00Z
+    --timezone=Asia/Tokyo        timestamp[us, tz=UTC]    2016-02-29 15:00:00Z
+
+Stamping the source zone instead would split the readership. Parquet cannot
+record a timezone *name* at all -- its timestamp type carries only
+`isAdjustedToUTC` plus the unit -- so a name survives solely in Arrow's
+`ARROW:schema` metadata. pyarrow and polars would recover it and render the
+values back in the source zone, while DuckDB, Spark, Trino and Dremio, which
+see the Parquet type alone, would render the instant. Identical bytes would
+show two different times, and the Arrow rendering would look as though no
+conversion had happened. Naming UTC keeps every reader agreeing.
+
+Engines differ in what they do with `isAdjustedToUTC`, so it is worth knowing
+your target. Measured against `dremio/dremio-oss` with both files loaded from
+S3, Dremio renders the stored value verbatim and never shifts it:
+
+    ts_naive     (isAdjustedToUTC=false)   TIMESTAMP   2023-03-15 00:00:00.000
+    ts_chicago   (isAdjustedToUTC=true)    TIMESTAMP   2023-03-15 05:00:00.000
+
+Both arrive as a plain `TIMESTAMP`, and the same two files render identically
+on a Dremio whose host clock is `Asia/Tokyo` -- its `CURRENT_TIMESTAMP` stays
+UTC regardless. So Dremio applies no session zone in either direction, which
+makes both modes stable there, unlike DuckDB, which re-renders an instant in
+whatever zone the session is set to. The flip side is that Dremio shows no
+difference between the two: a wall clock and a UTC instant are the same type on
+arrival, so which one a column holds has to be conveyed by naming or
+documentation rather than by the schema.
+
+The source zone is therefore not preserved anywhere in the file. It is an input
+to the conversion, not part of the result; record it in a column comment with
+`--field-comment` if the provenance matters downstream.
+
+Timestamps are written as `timestamp[us]`. Microseconds are the finest unit a
+Qlik serial carries any signal in: one float64 ulp is about 0.63us at
+present-day serials. Rounding there removes the encoding noise — measured at up
+to 210ns on real Qlik output, which is what makes a stored `07:15:00` read back
+elsewhere as `07:14:59.999999` — without discarding anything the source could
+have expressed.
+
+`date32` and `time32[ms]` are timezone independent.
 
 ## Parallel decoding
 

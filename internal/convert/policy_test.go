@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ralforion/qvd2parquet/internal/qvd"
 	"github.com/ralforion/qvd2parquet/internal/qvdtest"
@@ -124,8 +125,39 @@ func TestResolveTimestampCarriesTimezone(t *testing.T) {
 	f := qvdtest.Field{Name: "TS", Type: "TIMESTAMP",
 		Symbols: []qvd.Symbol{qvdtest.Float(45000.5)}, Rows: []int{0}}
 	rs := mustResolve(t, f, func(o *Options) { o.Location = utc(); o.TimezoneName = "UTC" })
-	if got := rs.Columns[0].ArrowType.String(); !strings.Contains(got, "timestamp[ms") {
-		t.Errorf("type = %s, want a timestamp[ms] type", got)
+	if got := rs.Columns[0].ArrowType.String(); !strings.Contains(got, "timestamp[us") {
+		t.Errorf("type = %s, want a timestamp[us] type", got)
+	}
+}
+
+// A QVD stores a naive wall clock, so --timezone=none must not stamp a zone:
+// the Arrow type carries no name, which is what makes Parquet record
+// isAdjustedToUTC=false and stops every reader shifting the value.
+func TestNaiveTimestampsCarryNoTimezone(t *testing.T) {
+	f := qvdtest.Field{Name: "TS", Type: "TIMESTAMP",
+		Symbols: []qvd.Symbol{qvdtest.Float(45000.5)}, Rows: []int{0}}
+	rs := mustResolve(t, f, func(o *Options) {
+		o.Location = utc()
+		o.TimezoneName = "none"
+		o.NaiveTimestamps = true
+	})
+	if got := rs.Columns[0].ArrowType.String(); got != "timestamp[us]" {
+		t.Errorf("type = %s, want timestamp[us] with no timezone", got)
+	}
+}
+
+// Reinterpreting a wall clock in UTC is the identity mapping, so the naive and
+// UTC modes must agree on every stored value and differ only in the type.
+func TestNaiveAndUTCStoreTheSameValues(t *testing.T) {
+	for _, serial := range []float64{45000.5, 42382.2604166667, 25569, 0.25} {
+		naive, ok := qvd.QlikDaysToTimestampMicros(serial, nil)
+		if !ok {
+			t.Fatalf("serial %v did not convert", serial)
+		}
+		asUTC, ok := qvd.QlikDaysToTimestampMicros(serial, time.UTC)
+		if !ok || naive != asUTC {
+			t.Errorf("serial %v: naive %d != UTC %d", serial, naive, asUTC)
+		}
 	}
 }
 
@@ -449,4 +481,66 @@ func TestOptionsValidate(t *testing.T) {
 
 func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o644)
+}
+
+// A zoned conversion has to place a naive wall clock on a timeline, and twice a
+// year that changes it. The QVD names no zone, so the change rests entirely on
+// the --timezone claim and must be reported rather than made silently.
+func TestZonedTimestampReportsDSTDiscontinuities(t *testing.T) {
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("no tzdata: %v", err)
+	}
+	// 2023-03-26 02:30 never happens in Berlin; 2023-10-29 02:30 happens twice.
+	f := qvdtest.Field{Name: "TS", Type: "TIMESTAMP",
+		Symbols: []qvd.Symbol{qvdtest.Float(45011.1041666667), qvdtest.Float(45228.1041666667)},
+		Rows:    []int{0, 1}}
+
+	rs := mustResolve(t, f, func(o *Options) { o.Location = berlin; o.TimezoneName = "Europe/Berlin" })
+	note := strings.Join(rs.Notes, " ")
+	for _, want := range []string{"do not exist in this timezone", "occur twice in this timezone", "--timezone=none"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("note = %q, want it to mention %q", note, want)
+		}
+	}
+
+	// The same values carry no such caveat when no zone is claimed.
+	rs = mustResolve(t, f, func(o *Options) {
+		o.Location = utc()
+		o.TimezoneName = "none"
+		o.NaiveTimestamps = true
+	})
+	if note := strings.Join(rs.Notes, " "); strings.Contains(note, "this timezone") {
+		t.Errorf("naive mode should report no timezone caveat, got %q", note)
+	}
+}
+
+// Stamping UTC is a statement about the stored value, not a shortcut past the
+// conversion: a zoned run must still place the wall clock on that zone's
+// timeline, so it lands on a different instant than a UTC run of the same input.
+func TestZonedRunStampsUTCButStillConverts(t *testing.T) {
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("no tzdata: %v", err)
+	}
+	const serial = 45000.5 // 2023-03-15 12:00 wall clock
+
+	zoned, ok := qvd.QlikDaysToTimestampMicros(serial, berlin)
+	if !ok {
+		t.Fatal("conversion failed")
+	}
+	asUTC, _ := qvd.QlikDaysToTimestampMicros(serial, time.UTC)
+	if zoned == asUTC {
+		t.Error("a Berlin run must land on a different instant than a UTC run")
+	}
+	if delta := asUTC - zoned; delta != int64(time.Hour/time.Microsecond) {
+		t.Errorf("delta = %d us, want one hour: Berlin is UTC+1 in March", delta)
+	}
+
+	f := qvdtest.Field{Name: "TS", Type: "TIMESTAMP",
+		Symbols: []qvd.Symbol{qvdtest.Float(serial)}, Rows: []int{0}}
+	rs := mustResolve(t, f, func(o *Options) { o.Location = berlin; o.TimezoneName = "Europe/Berlin" })
+	if got := rs.Columns[0].ArrowType.String(); got != "timestamp[us, tz=UTC]" {
+		t.Errorf("type = %s, want timestamp[us, tz=UTC]", got)
+	}
 }

@@ -14,6 +14,22 @@ previous behaviour.
 
 - Apache License 2.0. The project shipped without a licence file, which left
   its terms unstated.
+- `--timezone=none` writes timestamps with no timezone (Parquet
+  `isAdjustedToUTC=false`), preserving the QVD's naive wall clock so that every
+  reader shows the same value regardless of where the file is converted or
+  read. `naive` is accepted as a synonym.
+- A zoned conversion now stamps `tz=UTC` rather than the zone it was given.
+  `--timezone` states which zone the input wall clocks were recorded in, not how
+  to label the output, and what gets stored once they are on the timeline is a
+  UTC instant. Stamping the source zone made Arrow readers render the values
+  back in it while engines reading the Parquet type alone -- which carries no
+  name -- rendered the instant, so identical bytes showed two different times.
+  `--timezone=none` is unaffected and still writes no zone.
+- A zoned conversion now reports where it had to alter a wall clock. Twice a
+  year a DST change skips an hour, so a reading in it does not exist and gets
+  moved, or repeats an hour, so a reading in it has two instants and one is
+  chosen. A QVD names no timezone, which makes both changes a consequence of
+  the `--timezone` claim rather than of the data, so they are no longer silent.
 
 ### Removed
 
@@ -22,6 +38,23 @@ previous behaviour.
   It remains in the git history.
 
 ### Changed
+
+- **Breaking.** `--timezone` now defaults to `none`, so timestamps are written
+  as the naive wall clock the QVD actually holds and nothing is converted
+  unless asked. The previous default, `Local`, interpreted every reading in the
+  converting machine's timezone, which made the output depend on where it ran:
+  the same QVD produced three different instants on boxes in UTC, New York and
+  Tokyo, none of them correct unless the data happened to come from that zone.
+  Pass `--timezone=Local` to restore the old behaviour, or name the zone the
+  data was recorded in to get true instants.
+- `Options.TimezoneName` is now authoritative in `Validate`, which derives
+  `Location` and `NaiveTimestamps` from it. Setting one of those fields alone no
+  longer leaves the conversion disagreeing with the type.
+- Timestamps are now `timestamp[us]` rather than `timestamp[ms]`. A Qlik serial
+  resolves to about 0.63us at present-day dates, so milliseconds discarded real
+  signal while still carrying the encoding noise that makes a stored `07:15:00`
+  surface as `07:14:59.999999`. Rounding to the microsecond keeps the precision
+  and removes the noise.
 
 - Releases now ship Linux, Windows and macOS on `amd64` and `arm64` only. The
   32-bit, `arm`, `ppc64le`, `s390x`, `riscv64` and BSD targets were building

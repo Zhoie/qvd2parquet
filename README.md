@@ -11,6 +11,16 @@ instead of stringifying everything, keeps `MONEY` and `FIX` columns as exact
 Parquet decimals, decodes records in parallel, and streams batches into Parquet
 row groups so large files never need to be materialized in memory.
 
+![Converting a BSEG-shaped SAP extract](docs/sap-bseg-conversion.png)
+
+Above: 2.4 million rows of an SAP-shaped extract. `--inspect` reports the type
+chosen for every column and why, before anything is written. `BELNR`, `HKONT`
+and `KOSTL` stay text because their values are zero-padded codes that an
+integer would not preserve; `DMBTR` and `WRBTR` become exact decimals rather
+than floats; `BUDAT` and `CPUDT` are read as dates although the QVD declares no
+type for them. The input is a generated fixture with SAP field names and
+shapes, not a real extract.
+
 ## Install
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each release. From 1.0.0
@@ -125,7 +135,7 @@ pipelines and shell substitutions.
 
 ```text
 $ qvd2parquet --timezone UTC --quality-gate numeric sales.qvd sales.parquet
-qvd2parquet 1.0.0  (c) 2026, RALFORION d.o.o.
+qvd2parquet 1.0.1  (c) 2026, RALFORION d.o.o.
 qvd2parquet: sales.qvd: table "products", 77 rows, 7 bytes/record, 9 of 9 columns selected
 qvd2parquet: read 412 symbols in 1ms; records start at offset 8973
 qvd2parquet: schema: Einkaufspreis: REAL with 75 double symbols promoted to decimal(5,2); scale 2 inferred from values
@@ -144,7 +154,7 @@ Print the version and exit with `--version`:
 
 ```text
 $ qvd2parquet --version
-qvd2parquet 1.0.0  (c) 2026, RALFORION d.o.o.
+qvd2parquet 1.0.1  (c) 2026, RALFORION d.o.o.
 ```
 
 ### Examples
@@ -448,6 +458,14 @@ reuse, so both still fail and leave the call to you.
 | `string` | write the whole column as UTF-8; the display string wins for duals |
 | `promote` | keep numerics numeric and pure text as text; still fail on number + text unless `--mixed-string-fallback` |
 | `dual-columns` | write the numeric side under the original name and the display side as `${name}__text` |
+
+A column whose values are integers stored beside their own zero-padded digits
+is written as `utf8` under `--dual=auto`. The padding is part of the value: SAP keeps its keys as
+fixed-width codes -- `BELNR` is `CHAR(10)`, so document 100000001 is stored
+`0100000001` -- and reading that as 100000001 produces a key that no longer
+joins back. Padded decimals are formatting rather than codes, and dates are
+neither, so both keep their own typing. Naming a side with `--dual` overrides
+the inference: `--dual=numeric` still writes the number, padding and all lost.
 
 An untyped column whose display strings render its serial as a date or
 timestamp is read as one, so it arrives typed rather than as a bare serial with

@@ -4,11 +4,43 @@ All notable changes to qvd2parquet are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-While the major version is `0`, a minor bump may change conversion defaults;
-those changes are called out under **Changed** with the flag that restores the
-previous behaviour.
+From 1.0.0 the CLI surface and the conversion defaults are stable: a flag will
+not be removed or change its meaning, and a default will not change what an
+existing file converts to, outside a major bump. New behaviour arrives behind a
+new flag or a new value for an existing one.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-08-23
+
+### Changed
+
+- Declared stable: the CLI surface and the conversion defaults are now covered
+  by the compatibility promise above, having been validated against the Java
+  reference reader, against QlikView- and Qlik Sense-written files, and against
+  an independent third-party reader.
+- An untyped column whose display strings render its serial as a date or
+  timestamp is now read as one in two cases it previously missed, so the value
+  arrives typed instead of as a bare Qlik serial beside a `__text` sidecar.
+  A symbol carrying no value no longer disqualifies the column: one
+  empty-string placeholder among 2,991 dated duals was leaving the taxi files'
+  `trip_end_timestamp` as `float64` plus `trip_end_timestamp__text`, though
+  that placeholder is written as null either way. And the inference window now
+  reaches back to 1600 rather than 1900, because historical series are real
+  data -- the Stockholm temperature record starts in 1756. Across the twelve
+  QVDs used for validation this takes `__text` sidecars from four to none.
+  Labels are unaffected: a month number beside "Jan" still keeps both columns,
+  since "Jan" renders nothing about the serial 1.
+- A mixed text/number column no longer fails when the numeric symbols are
+  integers and every symbol carries its own display string. The file already
+  states the text for every value, so `utf8` reproduces all of them and nothing
+  is invented. This is what the LEGO `parts.qvd` and `inventory_parts.qvd` hit:
+  `part_num` holds `0901` beside the number 901, a code rather than a quantity,
+  which reading as 901 would destroy. Of the twelve real QVDs used for
+  validation, eleven now convert on the defaults where nine did; the twelfth is
+  deliberately corrupt. Decimals beside text, and bare numbers carrying no text,
+  still stop -- there a rendering would have to be chosen, and that is the
+  caller's call.
 
 ## [0.5.0] - 2026-08-22
 
@@ -287,7 +319,8 @@ First release.
   [pyqvd](https://pyqvd.readthedocs.io/stable/guide/qvd-file-format.html)
   description of the format.
 
-[Unreleased]: https://github.com/ralforion/qvd2parquet/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ralforion/qvd2parquet/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ralforion/qvd2parquet/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/ralforion/qvd2parquet/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ralforion/qvd2parquet/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/ralforion/qvd2parquet/compare/v0.3.0...v0.3.1

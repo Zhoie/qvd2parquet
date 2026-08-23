@@ -13,9 +13,11 @@ row groups so large files never need to be materialized in memory.
 
 ## Install
 
-See [CHANGELOG.md](CHANGELOG.md) for what changed in each release. Conversion
-defaults may change while the major version is `0`; every such change is listed
-under **Changed** with the flag that restores the previous behaviour.
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each release. From 1.0.0
+the CLI surface and the conversion defaults are stable: a flag will not be
+removed or change its meaning, and a default will not change what an existing
+file converts to, outside a major bump. New behaviour arrives behind a new flag
+or a new value for an existing one.
 
 ### Prebuilt binaries
 
@@ -123,7 +125,7 @@ pipelines and shell substitutions.
 
 ```text
 $ qvd2parquet --timezone UTC --quality-gate numeric sales.qvd sales.parquet
-qvd2parquet 0.5.0  (c) 2026, RALFORION d.o.o.
+qvd2parquet 1.0.0  (c) 2026, RALFORION d.o.o.
 qvd2parquet: sales.qvd: table "products", 77 rows, 7 bytes/record, 9 of 9 columns selected
 qvd2parquet: read 412 symbols in 1ms; records start at offset 8973
 qvd2parquet: schema: Einkaufspreis: REAL with 75 double symbols promoted to decimal(5,2); scale 2 inferred from values
@@ -142,7 +144,7 @@ Print the version and exit with `--version`:
 
 ```text
 $ qvd2parquet --version
-qvd2parquet 0.5.0  (c) 2026, RALFORION d.o.o.
+qvd2parquet 1.0.0  (c) 2026, RALFORION d.o.o.
 ```
 
 ### Examples
@@ -426,7 +428,19 @@ harmless, some are not:
 - dual numeric + display string — a normal Qlik concept, resolved by `--dual`.
 - number + unrelated text — never silently made numeric.
 
-`--mixed` selects what happens to the last case:
+One shape of the last case resolves on its own, because nothing is actually
+being decided: when the numeric symbols are **integers** and **every symbol in
+the column carries its own display string**, the file already states the text
+for every value, so the column is written as `utf8` without inventing a
+rendering for anything. The LEGO `parts.qvd` is the archetype -- `part_num`
+holds `0901` beside the number 901, and `0687b1` beside nothing at all. `0901`
+is a code, not a quantity, and reading it as 901 would not survive a round trip.
+
+The rule stops there. A **decimal** beside text is more likely a measurement
+whose display string is a formatting of it, and a bare number carries no text to
+reuse, so both still fail and leave the call to you.
+
+`--mixed` selects what happens to everything else:
 
 | Value | Behaviour |
 | --- | --- |
@@ -434,6 +448,16 @@ harmless, some are not:
 | `string` | write the whole column as UTF-8; the display string wins for duals |
 | `promote` | keep numerics numeric and pure text as text; still fail on number + text unless `--mixed-string-fallback` |
 | `dual-columns` | write the numeric side under the original name and the display side as `${name}__text` |
+
+An untyped column whose display strings render its serial as a date or
+timestamp is read as one, so it arrives typed rather than as a bare serial with
+a `__text` sidecar. Two things bound that: a symbol carrying no value is
+skipped, since a null placeholder says nothing about the rest of the column, and
+the serial has to fall between 1600 and 2200. The window reaches back that far
+because historical series are real -- the Stockholm temperature record starts in
+1756. It is a sanity check rather than the real filter: the display string still
+has to render that particular serial, which is why a month number beside `Jan`
+is not a date and keeps both columns.
 
 `--dual` selects which side of a Qlik dual is written:
 

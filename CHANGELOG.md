@@ -11,6 +11,59 @@ new flag or a new value for an existing one.
 
 ## [Unreleased]
 
+### Changed
+
+- `--workers=0` now resolves to one decode worker per two CPUs, with a floor of
+  two, instead of one per CPU. Decoding itself scales close to linearly, but it
+  is only half the pipeline -- the Parquet writer is a single goroutine -- and
+  every worker costs its share of in-flight Arrow memory, which on a wide file
+  is roughly `workers * batch-rows * columns * 16 bytes` and dominates resident
+  size. A 213-column file on a 16-core machine held around 9.8 GB at one worker
+  per CPU against 7.3 GB at four. Half the CPUs keeps about two thirds of the
+  decode throughput at half the batches in flight; on a hyper-threaded machine,
+  where `runtime.NumCPU()` counts threads, it works out to roughly one worker
+  per physical core. This changes only how much of the machine a conversion
+  uses, not what any file converts to, so it stays inside the compatibility
+  promise above. Pass `--workers` explicitly to override it in either
+  direction.
+- `--file-workers` divides the same automatic budget, so batch mode and
+  single-file mode now agree on how much of the machine to use.
+
+- `--quality-gate` now defaults to `full` instead of `none`. A conversion
+  nobody checked is not a conversion anybody can trust, and `full` is the only
+  mode that fingerprints values, so it is the only one that catches a value
+  which survived the type policy but not the round trip. Two consequences to
+  plan for. It is not free: the gate reads the whole output back and digests
+  every cell, which costs roughly 4.7x the conversion on a 213-column fixture
+  and grows with width, so name `basic`, `numeric` or `none` when throughput
+  matters. And a conversion that previously exited 0 can now exit 6, because
+  the file is checked where it previously was not -- a run that starts failing
+  under this default was already producing that output, the gate is only now
+  reporting it. Validation still reads the temporary file before the final
+  rename, so a failed gate never leaves a final-looking output behind.
+
+### Fixed
+
+- `BenchmarkDecode` measured four workers in every case above four. The
+  fixture is four chunks at the default batch size and `WorkerCount` clamps to
+  the chunk count, so the worker-scaling table in the README was reporting a
+  plateau that was the clamp rather than the code. The benchmark now uses a
+  batch small enough to keep every worker fed, names the automatic case
+  `workers=default` instead of `workers=numcpu`, measures one per CPU
+  separately, and reports the worker count each case actually ran.
+
+- Decode workers no longer serialize their reads on Windows. Every worker read
+  its chunks through the one `*os.File` opened for the input, and Windows -
+  unlike Unix `pread`, which needs no lock - implements `ReadAt` by taking that
+  descriptor's read and write locks and moving its shared file pointer, so all
+  workers queued on a single mutex for every chunk. Each worker now opens its
+  own handle, which is a separate kernel file object with its own pointer; the
+  handle is reopened from the path rather than duplicated, since a duplicated
+  handle shares the very pointer that lock exists to protect. A worker falls
+  back to the shared handle if the path cannot be reopened or no longer names
+  the same file, so a replaced input is never decoded unvalidated. Unix
+  behaviour is unchanged.
+
 ## [1.0.1] - 2026-08-23
 
 ### Fixed

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -162,7 +161,8 @@ type ManyOptions struct {
 	// OutDir receives the converted files.
 	OutDir string
 	// FileWorkers is how many files convert at once. The decode workers are
-	// divided between them, so the total stays near one per CPU.
+	// divided between them, so the total stays near the automatic worker
+	// count rather than multiplying it by the number of files in flight.
 	FileWorkers int
 	// Recursive descends into subdirectories when expanding a directory.
 	Recursive bool
@@ -351,7 +351,7 @@ func splitWorkerBudget(fileWorkers, decodeWorkers, files int) (int, int) {
 	}
 	budget := decodeWorkers
 	if budget <= 0 {
-		budget = runtime.NumCPU()
+		budget = DefaultWorkers()
 	}
 	perFile := budget / fileWorkers
 	if perFile < 1 {

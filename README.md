@@ -120,11 +120,11 @@ qvd2parquet --inspect [options] input.qvd
   -decimal-strict            Fail instead of rounding when a value does not fit its scale
   -compression zstd          Parquet compression: zstd|snappy|gzip|uncompressed
   -batch-rows 65536          Rows per Arrow batch and Parquet row group
-  -workers 0                 Decode workers, 0 means runtime.NumCPU()
+  -workers 0                 Decode workers, 0 means one per 2 CPUs (minimum 2)
   -timezone none             none|Local|UTC|IANA timezone name
   -schema path.json          Explicit schema override
   -schema-report path.json   Write the inferred schema/profile report
-  -quality-gate none         Validation mode: none|basic|numeric|full
+  -quality-gate full         Validation mode: none|basic|numeric|full
   -quality-report path.json  Write the post-conversion quality report
   -quality-tolerance 1e-9    Relative tolerance for floating-point quality checks
   -quality-abs-tolerance 0   Absolute tolerance for floating-point quality checks
@@ -239,19 +239,30 @@ first result.
 
 ### Parallelism
 
+Each decode worker reads its chunks through its own handle on the input. That
+matters on Windows, where concurrent `ReadAt` on a single file handle is
+serialized by the runtime -- it takes the descriptor's read and write locks and
+moves its shared file pointer -- so one handle would put every worker behind a
+single mutex.
+
 `--file-workers` converts several files at once and **divides the decode
-workers between them**, so the total stays near one per CPU:
+workers between them**, so the total stays near the default worker count:
 
 ```text
 $ qvd2parquet --out-dir out --file-workers 4 ./qvds
-qvd2parquet: converting 50 file(s), 4 at a time, 4 decode worker(s) each
+qvd2parquet: converting 50 file(s), 4 at a time, 2 decode worker(s) each
 ```
 
-The default is `1`: one file at a time, using every core to decode it. Raise it
-for many small files, where per-file parallelism beats per-chunk. This is the
-main reason folder conversion is built in rather than left to a shell loop —
-four separate processes would each start `NumCPU` workers, oversubscribing the
-machine fourfold.
+The default is `1`: one file at a time, decoding it with the default worker
+count. Raise it for many small files, where per-file parallelism beats
+per-chunk. This is the main reason folder conversion is built in rather than
+left to a shell loop — four separate processes would each start their own full
+set of workers, oversubscribing the machine fourfold.
+
+The budget being divided is the automatic worker count, not one per CPU, which
+is why four files at a time on a 16-CPU machine get two workers each. Raise
+`--workers` alongside `--file-workers` when the machine has headroom for more:
+`--file-workers 4 --workers 16` gives four each.
 
 ### The log
 
@@ -795,10 +806,10 @@ final-looking output behind.
 
 | Mode | What it checks |
 | --- | --- |
-| `none` (default) | nothing |
+| `none` | nothing |
 | `basic` | the file opens; row count, column names, and types match the resolved schema; per-column null counts match |
 | `numeric` | everything in `basic` plus sum, min, max (and sum of squares for floats) per numeric, decimal, date, timestamp and time column |
-| `full` | everything in `numeric` plus order-independent `sha256` value fingerprints per column |
+| `full` (default) | everything in `numeric` plus order-independent `sha256` value fingerprints per column |
 
 Integer, decimal and date/time aggregates are compared exactly — decimal sums
 use scaled-integer arithmetic, with no floating-point tolerance. Floating-point
@@ -815,30 +826,54 @@ a null never collides with a zero or an empty string.
 
 `--quality-report` is written on success and on failure.
 
-Recommended production setting:
+The gate defaults to `full`: a conversion nobody checked is not a conversion
+anybody can trust, and the fingerprints are what catch a value that survived
+the type policy but not the round trip. It is not free — it reads the whole
+output back and digests every cell, which on a wide file costs several times
+the conversion itself (see [Performance](#performance)). When that is too much
+for a run, name a cheaper mode explicitly:
 
 ```sh
 --quality-gate=numeric --quality-report out.quality.json
 ```
+
+`--quality-gate=none` skips validation entirely. Prefer `basic` over `none` if
+throughput matters: it still catches a truncated or mistyped output, and costs
+a fraction of `full`.
 
 ## Performance
 
 Measured on an Apple M3 Max (16 cores) over a 200k-row synthetic fixture with
 integer, high-cardinality string, decimal, date and nullable double columns.
 
-Decode only (no Parquet writing):
+Decode only (no Parquet writing), the fixture split into ~98 chunks:
 
 | Workers | Rows/s |
 | --- | --- |
-| 1 | 5.5M |
-| 2 | 8.1M |
-| 4 | 14.7M |
-| 8 | 14.2M |
-| NumCPU | 15.5M |
+| 1 | 4.6M |
+| 2 | 8.3M |
+| 4 | 13.6M |
+| 8 | 18.8M |
+| `--workers=0` default, 8 here | 18.4M |
+| one per CPU, 16 here | 28.6M |
 
-Scaling flattens around 4-8 workers on this fixture because symbol resolution
-becomes memory-bound. The `--workers=0` default (one per CPU) is a good starting
-point; lower it to reduce peak memory.
+Decoding is the parallel half of the pipeline, and it scales: 6x on 16 CPUs.
+
+An earlier version of this table showed it flattening after four workers. That
+was an artifact. `WorkerCount` clamps to the number of chunks, and at the
+default 65536-row batch this fixture is only four chunks, so the `8` and
+`NumCPU` rows were both measuring four workers. The benchmark now uses a small
+batch and reports the worker count each case actually ran, so a clamp cannot
+hide in the numbers again.
+
+`--workers=0` resolves to one per two CPUs: about two thirds of the decode
+throughput of one per CPU, at half the batches in flight. That trade is what
+the default is for — on a wide file, in-flight Arrow memory is the binding
+constraint, not decode (see [Memory](#memory)). On a hyper-threaded machine,
+where `runtime.NumCPU()` counts threads, it works out to roughly one worker per
+physical core. Raise it when the machine has headroom; lower it when it does
+not. Only decoding is parallel — the Parquet writer is a single goroutine — so
+the full pipeline scales less steeply than this table.
 
 Full pipeline including Parquet writing:
 
@@ -862,8 +897,22 @@ Quality gate overhead (100k rows, full pipeline):
 `basic` and `numeric` cost about the same because both must read the whole
 Parquet file back. `full` adds a `sha256` digest per cell, which dominates.
 
+The overhead is per cell, not per row, so it grows with width. On a 213-column,
+1M-row fixture on the same machine, wall clock for the whole run:
+
+| Mode | Wall clock | Overhead vs `none` |
+| --- | --- | --- |
+| `none` | 20.3s | — |
+| `basic` | 32.4s | ~1.6x |
+| `numeric` | 32.6s | ~1.6x |
+| `full` (default) | 95.4s | ~4.7x |
+
+Budget for that on a wide file, or name a cheaper mode.
+
 Batch size (`--batch-rows`) peaks around 16k-64k rows; larger batches trade
-throughput for memory.
+throughput for memory. Read that benchmark with the clamp above in mind: batch
+size also sets the chunk count, so on a fixture this size the largest batches
+leave too few chunks to keep every worker busy.
 
 Reproduce:
 
@@ -878,7 +927,8 @@ go test ./internal/convert -run XXX -bench . -benchtime 3x
 Peak memory is roughly:
 
 - the symbol tables of the selected columns, plus
-- `workers * batch-rows` of Arrow builder memory, plus
+- `workers * batch-rows * columns` of Arrow builder memory — on a wide file
+  this dominates, at roughly 16 bytes per in-flight cell — plus
 - Parquet writer buffers, plus
 - one `batch-rows * RecordByteSize` scratch buffer per worker.
 

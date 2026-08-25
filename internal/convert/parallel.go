@@ -62,11 +62,35 @@ func Chunks(rows int64, batchRows int, recordSize int, recordStart int64) []Deco
 	return out
 }
 
+// MinDefaultWorkers is the floor under the automatic worker count, so a small
+// machine still decodes in parallel.
+const MinDefaultWorkers = 2
+
+// DefaultWorkers is the worker count --workers=0 resolves to: one per two
+// CPUs, never fewer than MinDefaultWorkers.
+//
+// It is deliberately below runtime.NumCPU(). Decoding itself scales close to
+// linearly, but it is only half the pipeline -- the Parquet writer is a single
+// goroutine -- and every worker costs its share of in-flight Arrow memory,
+// which on a wide file is roughly workers * batch-rows * columns * 16 bytes
+// and dominates resident size. Half the CPUs keeps most of the decode
+// throughput at half the batches in flight.
+//
+// The divisor applies to logical CPUs, so on a hyper-threaded machine this is
+// about one worker per physical core.
+func DefaultWorkers() int {
+	n := runtime.NumCPU() / 2
+	if n < MinDefaultWorkers {
+		n = MinDefaultWorkers
+	}
+	return n
+}
+
 // WorkerCount resolves the --workers option.
 func WorkerCount(requested int, chunks int) int {
 	n := requested
 	if n <= 0 {
-		n = runtime.NumCPU()
+		n = DefaultWorkers()
 	}
 	if chunks > 0 && n > chunks {
 		n = chunks
@@ -205,8 +229,11 @@ func (c *Converter) Run(ctx context.Context, sink RecordSink, progress ProgressF
 // worker holds the per-goroutine state: its own Arrow builders, record buffer
 // and scratch slices. Nothing here is shared between goroutines.
 type worker struct {
-	c      *Converter
-	file   *os.File
+	c    *Converter
+	file *os.File
+	// own is this worker's private handle on the input, closed on release.
+	// It is nil when the worker shares the File's handle instead.
+	own    *os.File
 	batch  *Batch
 	raw    []byte
 	symIdx []int64
@@ -214,9 +241,36 @@ type worker struct {
 	mem    memory.Allocator
 }
 
+// openWorkerFile opens a private handle on the QVD for one decode worker. It
+// returns nil when the worker should fall back to sharing the File's handle.
+//
+// Windows serializes concurrent ReadAt on a single *os.File: internal/poll's
+// Pread takes that descriptor's read and write locks and moves the shared file
+// pointer, so every worker queues on one mutex for every chunk. Unix pread
+// needs no such lock. A private handle is a separate kernel file object with
+// its own pointer, which is why this reopens the path -- duplicating the
+// handle would share the pointer the lock exists to protect.
+func openWorkerFile(qf *qvd.File) *os.File {
+	f, err := os.Open(qf.Path)
+	if err != nil {
+		return nil
+	}
+	// The path can name a different file than the header was read from if the
+	// input was replaced mid-run. Decoding records from a file nobody
+	// validated would be worse than losing the parallel read, so share the
+	// original handle instead.
+	mine, errMine := f.Stat()
+	orig, errOrig := qf.FileHandle().Stat()
+	if errMine != nil || errOrig != nil || !os.SameFile(mine, orig) {
+		f.Close()
+		return nil
+	}
+	return f
+}
+
 func (c *Converter) newWorker() *worker {
 	mem := memory.NewGoAllocator()
-	return &worker{
+	w := &worker{
 		c:      c,
 		file:   c.File.FileHandle(),
 		batch:  c.NewBatch(mem, c.Options.BatchRows),
@@ -225,9 +279,18 @@ func (c *Converter) newWorker() *worker {
 		hash:   c.Options.Quality == QualityFull,
 		mem:    mem,
 	}
+	if own := openWorkerFile(c.File); own != nil {
+		w.own, w.file = own, own
+	}
+	return w
 }
 
-func (w *worker) release() { w.batch.Release() }
+func (w *worker) release() {
+	w.batch.Release()
+	if w.own != nil {
+		w.own.Close()
+	}
+}
 
 // decodeChunk reads one contiguous byte range and converts it into an Arrow
 // record plus chunk-local quality metrics.

@@ -294,3 +294,99 @@ func replaceOnce(b, old, repl []byte) []byte {
 	copy(out[i:], repl)
 	return out
 }
+
+// Each decode worker gets its own handle on the input. Windows serializes
+// concurrent ReadAt on a shared *os.File, so sharing one handle would put
+// every worker behind a single mutex for every chunk.
+func TestOpenWorkerFileIsPrivateHandle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "w.qvd")
+	if _, err := qvdtest.Build(path, benchTable(64)); err != nil {
+		t.Fatal(err)
+	}
+	qf, err := qvd.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer qf.Close()
+
+	own := openWorkerFile(qf)
+	if own == nil {
+		t.Fatal("openWorkerFile returned nil for a readable input")
+	}
+	defer own.Close()
+	if own == qf.FileHandle() {
+		t.Error("worker got the shared handle, not a private one")
+	}
+
+	// The private handle must read the same bytes at the same offsets.
+	want := make([]byte, 64)
+	if _, err := qf.FileHandle().ReadAt(want, 0); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 64)
+	if _, err := own.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("private handle read different bytes than the shared handle")
+	}
+
+	// A second handle is independent: reading through one must not move the
+	// other's file pointer, which is the whole point of not duplicating it.
+	other := openWorkerFile(qf)
+	if other == nil {
+		t.Fatal("second openWorkerFile returned nil")
+	}
+	defer other.Close()
+	if other == own {
+		t.Error("two workers got the same handle")
+	}
+}
+
+// A path that no longer names the file the header was read from falls back to
+// the shared handle, rather than decoding records from a file nobody validated.
+//
+// Both cases repoint File.Path instead of renaming or removing the input.
+// Windows refuses to replace or delete a file another handle holds open, so
+// driving this from the filesystem would leave the test running on Unix only --
+// and this fallback exists for Windows.
+func TestOpenWorkerFileFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "w.qvd")
+	if _, err := qvdtest.Build(path, benchTable(64)); err != nil {
+		t.Fatal(err)
+	}
+	qf, err := qvd.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer qf.Close()
+
+	// The path names a different file, as it would if the input were replaced
+	// mid-run.
+	other := filepath.Join(dir, "other.qvd")
+	if _, err := qvdtest.Build(other, benchTable(128)); err != nil {
+		t.Fatal(err)
+	}
+	qf.Path = other
+	if got := openWorkerFile(qf); got != nil {
+		got.Close()
+		t.Error("openWorkerFile used a different file instead of falling back")
+	}
+
+	// The path names nothing at all.
+	qf.Path = filepath.Join(dir, "gone.qvd")
+	if got := openWorkerFile(qf); got != nil {
+		got.Close()
+		t.Error("openWorkerFile returned a handle for a missing path")
+	}
+
+	// Restored, it opens again: the fallbacks above were caused by the path,
+	// not by anything sticky about the file or the test.
+	qf.Path = path
+	if got := openWorkerFile(qf); got == nil {
+		t.Error("openWorkerFile fell back for the original, unchanged path")
+	} else {
+		got.Close()
+	}
+}

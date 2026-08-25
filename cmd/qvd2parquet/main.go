@@ -27,6 +27,7 @@ const (
 	exitInput       = 4
 	exitOutput      = 5
 	exitQuality     = 6
+	exitCanceled    = 7
 )
 
 // Program identity. version is overridden at build time with
@@ -102,7 +103,8 @@ func run() int {
 			"  3  schema/type policy error\n"+
 			"  4  input read/decode error\n"+
 			"  5  output/write error\n"+
-			"  6  quality gate failure\n")
+			"  6  quality gate failure\n"+
+			"  7  cancelled by Ctrl-C or SIGTERM\n")
 	}
 
 	def := convert.DefaultOptions()
@@ -242,8 +244,35 @@ func run() int {
 		return usageErr(err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// Handled explicitly rather than with signal.NotifyContext, whose stop
+	// function cancels the context as well as unregistering the handler. A
+	// goroutine waiting on Done therefore cannot tell a real signal from the
+	// deferred cleanup of a successful run, and announces a cancellation on
+	// almost every one.
+	//
+	// Once a signal arrives the default handler is restored, so an impatient
+	// second Ctrl-C terminates the process outright: the first one only asks,
+	// and the step in progress -- the quality gate on a wide file -- can take
+	// minutes to wind down. A signal with no visible effect reads as a hang,
+	// hence the message.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go func() {
+		select {
+		case <-signals:
+			cancel()
+			signal.Stop(signals)
+			fmt.Fprintf(os.Stderr,
+				"%s: cancelling, finishing the current step; press Ctrl-C again to stop now\n",
+				programName)
+		case <-ctx.Done():
+			// The run finished and the deferred cancel fired. Not a signal:
+			// say nothing.
+		}
+	}()
 
 	fmt.Fprintln(os.Stderr, banner())
 
@@ -389,6 +418,12 @@ func exitCodeFor(err error) int {
 		return exitSchema
 	case errors.Is(err, qvd.ErrUnsupported):
 		return exitUnsupported
+	case errors.Is(err, convert.ErrCanceled),
+		// A bare context error from any path that has not wrapped it: still a
+		// cancellation, and must not fall through to the input-error code.
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return exitCanceled
 	case errors.Is(err, convert.ErrInput):
 		return exitInput
 	default:

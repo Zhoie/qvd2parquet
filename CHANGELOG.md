@@ -134,6 +134,43 @@ minor one:
   default. It previously printed nothing until it finished, so a run that was
   working looked like one that had hung.
 
+- Ctrl-C and `SIGTERM` now shut down gracefully and report themselves as what
+  they are. A cancelled run stops at the next chunk boundary, drains what is in
+  flight, removes the temporary output and exits with a new code `7`.
+
+  It previously exited `4`, `input error`, with `wrote 234725 rows but the
+  header declares 1000000` -- a stopped run has written fewer rows than the
+  header declares, which is exactly what a truncated input looks like, so
+  pressing Ctrl-C told the user their QVD was corrupt. A cancelled quality gate
+  likewise reported a gate failure, as though the output had not matched its
+  input, when nobody had finished looking.
+
+  A temporary output that cannot be deleted is now reported and named, instead
+  of the failure being discarded and a partial Parquet file left sitting beside
+  the real one. The delete is retried briefly first: Windows refuses to remove
+  a file while any handle is open, and a virus scanner or the search indexer
+  routinely holds one for a moment on a file just written, so the first attempt
+  can fail on a file that is about to be perfectly deletable.
+
+  In batch mode the files not yet started are recorded as cancelled too, rather
+  than carrying a bare `context.Canceled` that mapped to the input-error code
+  and reported unattempted files as unreadable ones. A cancelled batch
+  outranks any individual file's verdict in the summary, since the rest were
+  never tried.
+
+  The signal handler is written against an explicit channel rather than
+  `signal.NotifyContext`, whose stop function cancels the context as well as
+  unregistering the handler: a goroutine waiting on `Done` cannot tell a real
+  signal from the deferred cleanup of a successful run, and announced a
+  cancellation on 37 of 40 successful conversions.
+
+  The quality gate also honours cancellation at all now: it ran on
+  `context.Background()`, so Ctrl-C during the read-back did nothing whatsoever
+  -- on a wide file, minutes of a signal being ignored. And because
+  `signal.NotifyContext` keeps swallowing signals once it has fired, a second
+  Ctrl-C did nothing either. The first signal now restores the default handler
+  and says so, so an impatient second one stops the process outright.
+
 ### Fixed
 
 - `BenchmarkDecode` measured four workers in every case above four. The

@@ -166,7 +166,11 @@ func Run(ctx context.Context, inputPath, outputPath string, opts *Options, logf 
 	committed := false
 	defer func() {
 		if !committed {
-			w.Abort()
+			// Say so rather than leaving a partial Parquet file sitting next
+			// to the real output with nobody aware of it.
+			if err := w.Abort(); err != nil {
+				logf("warning: %v", err)
+			}
 		}
 	}()
 
@@ -188,7 +192,7 @@ func Run(ctx context.Context, inputPath, outputPath string, opts *Options, logf 
 	var report *QualityReport
 	if opts.Quality != QualityNone {
 		gateStart := time.Now()
-		report, err = RunQualityGate(inputPath, outputPath, w.TempPath(), rs, metrics, opts, logf)
+		report, err = RunQualityGate(ctx, inputPath, outputPath, w.TempPath(), rs, metrics, opts, logf)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -24,7 +24,16 @@ type InspectReport struct {
 	SymbolCount int64
 	FieldCount  int
 	Excluded    []string
-	Elapsed     time.Duration
+	// ExcludeNoMatch holds the --exclude patterns that matched no field.
+	// Inspect is where a command line gets checked before a long conversion,
+	// so a pattern that will drop nothing belongs here above all.
+	ExcludeNoMatch []string
+	// Renames records what --field-regex did to the selected fields. It is
+	// held here rather than read from Schema because a file the type policy
+	// rejects has no resolved schema, and a run that fails on one column is
+	// exactly when the rest of the command line wants checking.
+	Renames RenameSummary
+	Elapsed time.Duration
 
 	Schema *ResolvedSchema
 	File   *qvd.File
@@ -58,7 +67,7 @@ func Inspect(inputPath string, opts *Options) (*InspectReport, error) {
 		f.Close()
 		return nil, err
 	}
-	excluded, err := f.ExcludeColumns(opts.Exclude)
+	excluded, unmatched, err := f.ExcludeColumns(opts.Exclude)
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -77,6 +86,8 @@ func Inspect(inputPath string, opts *Options) (*InspectReport, error) {
 		SymbolBytes:    f.RecordStart - f.HeaderEnd,
 		FieldCount:     len(f.Columns),
 		Excluded:       excluded,
+		ExcludeNoMatch: unmatched,
+		Renames:        SummarizeRenames(opts.Renamer, selectedNames(f)),
 		File:           f,
 		Options:        opts,
 	}
@@ -122,6 +133,12 @@ func (r *InspectReport) Write(w io.Writer) error {
 		fmt.Fprintf(w, " (%d excluded: %s)", len(r.Excluded), strings.Join(r.Excluded, ", "))
 	}
 	fmt.Fprintln(w)
+	if len(r.ExcludeNoMatch) > 0 {
+		fmt.Fprintf(w, "Exclude         %s matched no field\n", quotedList(r.ExcludeNoMatch))
+	}
+	if line := r.Renames.Line(maxNamedFields); line != "" {
+		fmt.Fprintf(w, "Field regex     %s\n", line)
+	}
 	fmt.Fprintln(w)
 
 	if r.SchemaErr != nil {

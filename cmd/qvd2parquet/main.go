@@ -121,6 +121,7 @@ func run() int {
 		decSource     = fs.String("decimal-source", def.DecimalSource.String(), "Decimal extraction: auto|text|numeric")
 		decStrict     = fs.Bool("decimal-strict", def.DecimalStrict, "Fail instead of rounding when a decimal value does not fit its scale")
 		compression   = fs.String("compression", def.Compression, "Parquet compression: zstd|snappy|gzip|uncompressed")
+		encoding      = fs.String("encoding", "", "Pin column encodings: PATTERN=ENCODING,... e.g. '%*_PKEY=delta_byte_array'")
 		batchRows     = fs.Int("batch-rows", def.BatchRows, "Rows per Arrow batch, 0 sizes it from the column count to hold in-flight memory steady")
 		rowGroupRows  = fs.Int("row-group-rows", def.RowGroupRows, "Rows per Parquet row group")
 		workers       = fs.Int("workers", def.Workers, "Decode workers, 0 means one per 2 CPUs (minimum 2)")
@@ -207,6 +208,10 @@ func run() int {
 	opts.Exclude = splitList(*exclude)
 
 	if opts.Renamer, err = convert.NewFieldRenamer(*fieldRegex, *fieldName, *fieldComment); err != nil {
+		return usageErr(err)
+	}
+
+	if opts.Encodings, err = convert.ParseEncodingRules(*encoding); err != nil {
 		return usageErr(err)
 	}
 
@@ -376,6 +381,14 @@ func runInspect(inputPath string, opts *convert.Options) int {
 	// A file the type policy rejects exits non-zero, so scripts can gate on it.
 	if rep.SchemaErr != nil {
 		return exitCodeFor(rep.SchemaErr)
+	}
+	// So does a command line the conversion would refuse. Inspect is a
+	// preflight check, and one that reports a problem and exits 0 is worse
+	// than none: a script gating on it would go on to start the conversion
+	// that is about to fail.
+	if rep.EncodingErr != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", programName, rep.EncodingErr)
+		return exitCodeFor(rep.EncodingErr)
 	}
 	return exitOK
 }

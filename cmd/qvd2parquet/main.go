@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ralforion/qvd2parquet/internal/convert"
 	"github.com/ralforion/qvd2parquet/internal/parquetwrite"
@@ -140,7 +142,7 @@ func run() int {
 		outDir        = fs.String("out-dir", "", "Convert every input into this directory, one .parquet per .qvd")
 		fileWorkers   = fs.Int("file-workers", 1, "Files to convert at once; decode workers are divided between them")
 		recursive     = fs.Bool("recursive", false, "With --out-dir, descend into subdirectories")
-		logPath       = fs.String("log", "", "Append a JSON Lines record per file to this path")
+		logPath       = fs.String("log", "", "Write one JSON Lines record per input, then a summary")
 		inspect       = fs.Bool("inspect", false, "Read only the header and symbol tables, print the schema, and exit")
 		showVersion   = fs.Bool("version", false, "Print the version and exit")
 	)
@@ -165,6 +167,9 @@ func run() int {
 	case batch && *inspect:
 		fmt.Fprintf(os.Stderr, "%s: --inspect and --out-dir cannot be combined; "+
 			"inspect one file at a time\n", programName)
+		return exitUsage
+	case *inspect && *logPath != "":
+		fmt.Fprintf(os.Stderr, "%s: --log records conversions and cannot be combined with --inspect\n", programName)
 		return exitUsage
 	case !batch && *inspect && fs.NArg() != 1:
 		fmt.Fprintf(os.Stderr, "%s: --inspect expects an input path, got %d argument(s)\n\n",
@@ -292,7 +297,49 @@ func run() int {
 		return runBatch(ctx, fs.Args(), &opts, *outDir, *fileWorkers, *recursive, *logPath, logf)
 	}
 
-	stats, _, err := convert.Run(ctx, inputPath, outputPath, &opts, logf)
+	return runSingle(ctx, inputPath, outputPath, &opts, *logPath, logf)
+}
+
+// runSingle converts one explicit input/output pair. Its log uses the same
+// file-plus-summary records as runBatch so automation can query either mode
+// without knowing how many files the command converted.
+func runSingle(ctx context.Context, inputPath, outputPath string, opts *convert.Options,
+	logPath string, logf convert.Logf) int {
+
+	var log *convert.LogWriter
+	if logPath != "" {
+		if err := validateLogPath(logPath, inputPath, outputPath, opts); err != nil {
+			return usageErr(err)
+		}
+		var err error
+		if log, err = convert.NewLogWriter(logPath); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
+			return exitOutput
+		}
+		defer log.Close()
+	}
+
+	started := time.Now()
+	stats, quality, err := convert.Run(ctx, inputPath, outputPath, opts, logf)
+	elapsed := time.Since(started)
+	if log != nil {
+		result := convert.FileResult{
+			Input: inputPath, Output: outputPath, Stats: stats, Quality: quality,
+			Err: err, Started: started, Elapsed: elapsed,
+		}
+		summary := &convert.BatchResult{Results: []convert.FileResult{result}, Elapsed: elapsed}
+		if err != nil {
+			summary.Failed = 1
+		} else {
+			summary.Converted = 1
+			summary.Rows = stats.Rows
+			summary.Bytes = stats.OutputBytes
+		}
+		log.File(result)
+		log.Summary(summary)
+		fmt.Fprintf(os.Stderr, "%s: wrote %s\n", programName, logPath)
+	}
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
 		return exitCodeFor(err)
@@ -302,6 +349,150 @@ func run() int {
 		outputPath, stats.Rows, stats.Columns, humanBytes(stats.OutputBytes),
 		stats.Elapsed.Round(1e6), stats.RowsPerSecond())
 	return exitOK
+}
+
+// logCollision is a path the log must not share with another file, paired with
+// the name to report it under.
+type logCollision struct {
+	name string
+	path string
+}
+
+// checkLogCollisions reports the first path the log would collide with.
+// NewLogWriter creates its file with O_TRUNC, so a collision destroys whichever
+// of the two is written second while the run still reports writing both.
+func checkLogCollisions(logPath string, paths []logCollision) error {
+	for _, p := range paths {
+		if p.path != "" && samePath(logPath, p.path) {
+			return fmt.Errorf("--log path must differ from %s", p.name)
+		}
+	}
+	return nil
+}
+
+// validateLogPath prevents NewLogWriter from truncating a conversion input or
+// sharing a destination with another output.
+func validateLogPath(logPath, inputPath, outputPath string, opts *convert.Options) error {
+	return checkLogCollisions(logPath, []logCollision{
+		{"the input path", inputPath},
+		{"the output path", outputPath},
+		{"--schema", opts.SchemaOverridePath},
+		{"--schema-report", opts.SchemaReportPath},
+		{"--quality-report", opts.QualityReportPath},
+	})
+}
+
+// validateBatchLogPath is the same guard for a batch, where none of the paths
+// at risk were typed on the command line: the inputs come from expanding
+// directories, and every output and per-file report is derived from an input
+// under --out-dir. It has to run after FindInputs for that reason, and before
+// NewLogWriter, which truncates whatever it opens.
+//
+// The message names the offending file rather than its role, because a batch
+// may have found hundreds and "the input path" would not say which one.
+func validateBatchLogPath(logPath string, inputs []string, problems []convert.InputProblem,
+	outDir string, opts *convert.Options) error {
+
+	if err := checkLogCollisions(logPath, []logCollision{
+		{"--schema", opts.SchemaOverridePath},
+	}); err != nil {
+		return err
+	}
+	// A path FindInputs could not examine is still an input: the run reports it
+	// as a failed file and writes it to the log. Letting the log take that path
+	// produced a run that named the file as missing and created it in the same
+	// breath, the log's first record reporting the failure of the path it was
+	// being written to. No output or report is derived from one, so the path
+	// itself is the whole check.
+	for _, p := range problems {
+		if err := checkLogCollisions(logPath, []logCollision{
+			{"the input " + p.Path, p.Path},
+		}); err != nil {
+			return err
+		}
+	}
+	for _, in := range inputs {
+		out := convert.OutputPathFor(in, outDir)
+		if err := checkLogCollisions(logPath, []logCollision{
+			{"the input " + in, in},
+			{"the output " + out, out},
+			{"the --schema-report for " + in,
+				convert.PerFileReportPath(opts.SchemaReportPath, in, outDir)},
+			{"the --quality-report for " + in,
+				convert.PerFileReportPath(opts.QualityReportPath, in, outDir)},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// samePath resolves existing symlinks and the nearest existing parent. The
+// latter catches two not-yet-created files beneath differently spelled aliases
+// of the same directory.
+func samePath(a, b string) bool {
+	infoA, errA := os.Stat(a)
+	infoB, errB := os.Stat(b)
+	if errA == nil && errB == nil && os.SameFile(infoA, infoB) {
+		return true
+	}
+	// Fold case on every platform, not only Windows. Whether two spellings
+	// name one file is a property of the filesystem, not of the OS: macOS is
+	// case-insensitive by default, Linux mounts exFAT, NTFS and SMB that way,
+	// and Windows supports per-directory case sensitivity. No list of GOOS
+	// values answers the question.
+	//
+	// os.SameFile above already settles it for files that exist, so this
+	// governs only files about to be created -- the --force path. There the
+	// two errors are not comparable. Refusing a legal pair costs a rename;
+	// allowing an illegal one lets the second writer replace the first, which
+	// on a case-insensitive filesystem left a file named RUN.JSONL holding
+	// Parquet, the log unlinked, and an exit code of 0. So fold, and accept
+	// rejecting a pair that a case-sensitive filesystem would have allowed.
+	//
+	// This does not cover Unicode normalisation, which APFS also folds:
+	// "café.jsonl" and "cafe\u0301.jsonl" are one file there and compare
+	// unequal here.
+	return strings.EqualFold(canonicalPath(a), canonicalPath(b))
+}
+
+func canonicalPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+
+	// EvalSymlinks cannot resolve a dangling final symlink, but Create follows
+	// it. Follow that final link explicitly before resolving its parent.
+	for i := 0; i < 255; i++ {
+		info, err := os.Lstat(abs)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			break
+		}
+		target, err := os.Readlink(abs)
+		if err != nil {
+			break
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(abs), target)
+		}
+		abs = filepath.Clean(target)
+	}
+
+	current := abs
+	var suffix []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			parts := append([]string{resolved}, suffix...)
+			return filepath.Clean(filepath.Join(parts...))
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return filepath.Clean(abs)
+		}
+		suffix = append([]string{filepath.Base(current)}, suffix...)
+		current = parent
+	}
 }
 
 // runBatch converts every input into --out-dir, continuing past a failure so
@@ -325,6 +516,9 @@ func runBatch(ctx context.Context, paths []string, opts *convert.Options,
 
 	var log *convert.LogWriter
 	if logPath != "" {
+		if err := validateBatchLogPath(logPath, inputs, problems, outDir, opts); err != nil {
+			return usageErr(err)
+		}
 		var err error
 		if log, err = convert.NewLogWriter(logPath); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)

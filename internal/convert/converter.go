@@ -31,6 +31,9 @@ type Stats struct {
 	// that worked.
 	ExcludeNoMatch []string
 	Renames        RenameSummary
+	// Encodings names the columns written with a pinned or measured encoding,
+	// as "NAME=encoding".
+	Encodings []string
 }
 
 // maxNamedFields caps how many field names a single log line will list. A run
@@ -64,6 +67,14 @@ func Run(ctx context.Context, inputPath, outputPath string, opts *Options, logf 
 		return nil, nil, err
 	}
 	defer f.Close()
+
+	// Refuse an output that cannot be written before doing any work for it.
+	// The writer checks again when it creates the file, which is what
+	// actually guarantees it; this only means a missing --force costs
+	// milliseconds rather than a symbol pass and an encoding measurement.
+	if err := parquetwrite.CheckOutput(outputPath, opts.Force); err != nil {
+		return nil, nil, err
+	}
 
 	if err := f.SelectColumns(opts.Columns); err != nil {
 		return nil, nil, err
@@ -153,8 +164,31 @@ func Run(ctx context.Context, inputPath, outputPath string, opts *Options, logf 
 		}
 	}
 
+	// Encodings are settled before the schema report is written, so the report
+	// describes the file the run is about to produce rather than the one it
+	// would have produced without measuring.
+	enc, err := ResolveEncodings(opts.Encodings.Rules, rs, f)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Pins are reported before any measurement, since a measurement that
+	// follows must leave them alone. What it adopts reports itself.
+	if len(enc.Pinned) > 0 {
+		logf("encoding: %s", strings.Join(enc.Pinned, ", "))
+	}
+	if len(enc.Unmatched) > 0 {
+		logf("note: --encoding %s matched no column; patterns are wildcards over "+
+			"the output column names and the original QVD names",
+			quotedList(enc.Unmatched))
+	}
+	if opts.Encodings.Auto {
+		if err := applyMeasuredEncodings(ctx, f, rs, opts, enc, logf); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	if opts.SchemaReportPath != "" {
-		if err := WriteSchemaReport(opts.SchemaReportPath, inputPath, f, rs, opts); err != nil {
+		if err := WriteSchemaReport(opts.SchemaReportPath, inputPath, f, rs, opts, enc); err != nil {
 			return nil, nil, err
 		}
 		logf("wrote schema report to %s", opts.SchemaReportPath)
@@ -180,18 +214,6 @@ func Run(ctx context.Context, inputPath, outputPath string, opts *Options, logf 
 	codec, err := parquetwrite.ParseCompression(opts.Compression)
 	if err != nil {
 		return nil, nil, err
-	}
-	enc, err := ResolveEncodings(opts.Encodings, rs, f)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(enc.Pinned) > 0 {
-		logf("encoding: %s", strings.Join(enc.Pinned, ", "))
-	}
-	if len(enc.Unmatched) > 0 {
-		logf("note: --encoding %s matched no column; patterns are wildcards over "+
-			"the output column names and the original QVD names",
-			quotedList(enc.Unmatched))
 	}
 	w, err := parquetwrite.Create(outputPath, rs.Arrow, parquetwrite.Options{
 		Compression:     codec,
@@ -268,6 +290,7 @@ func Run(ctx context.Context, inputPath, outputPath string, opts *Options, logf 
 		DecimalsNearLimit: decimalsNearLimit(rs, f),
 		ExcludeNoMatch:    unmatchedExcludes,
 		Renames:           rs.Renames,
+		Encodings:         enc.Pinned,
 	}
 	if fi, err := os.Stat(outputPath); err == nil {
 		st.OutputBytes = fi.Size()
@@ -347,11 +370,11 @@ type DecimalReport struct {
 }
 
 // WriteSchemaReport saves the inferred schema and profiles as JSON.
-func WriteSchemaReport(path, inputPath string, f *qvd.File, rs *ResolvedSchema, opts *Options) error {
-	// Resolution errors are reported by the conversion itself, which fails on
-	// them; a report should still describe everything it can.
+// enc may be nil, in which case no column carries an encoding: a caller that
+// has not resolved them has nothing to report about them.
+func WriteSchemaReport(path, inputPath string, f *qvd.File, rs *ResolvedSchema, opts *Options, enc *ResolvedEncodings) error {
 	pinned := map[string]parquetwrite.Encoding{}
-	if enc, err := ResolveEncodings(opts.Encodings, rs, f); err == nil {
+	if enc != nil {
 		pinned = enc.ByColumn
 	}
 	rep := SchemaReport{

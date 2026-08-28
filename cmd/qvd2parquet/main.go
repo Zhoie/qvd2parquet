@@ -121,7 +121,7 @@ func run() int {
 		decSource     = fs.String("decimal-source", def.DecimalSource.String(), "Decimal extraction: auto|text|numeric")
 		decStrict     = fs.Bool("decimal-strict", def.DecimalStrict, "Fail instead of rounding when a decimal value does not fit its scale")
 		compression   = fs.String("compression", def.Compression, "Parquet compression: zstd|snappy|gzip|uncompressed")
-		encoding      = fs.String("encoding", "", "Pin column encodings: PATTERN=ENCODING,... e.g. '%*_PKEY=delta_byte_array'")
+		encoding      = fs.String("encoding", "", "Pin column encodings: PATTERN=ENCODING,... or 'auto' to measure per file")
 		batchRows     = fs.Int("batch-rows", def.BatchRows, "Rows per Arrow batch, 0 sizes it from the column count to hold in-flight memory steady")
 		rowGroupRows  = fs.Int("row-group-rows", def.RowGroupRows, "Rows per Parquet row group")
 		workers       = fs.Int("workers", def.Workers, "Decode workers, 0 means one per 2 CPUs (minimum 2)")
@@ -211,7 +211,7 @@ func run() int {
 		return usageErr(err)
 	}
 
-	if opts.Encodings, err = convert.ParseEncodingRules(*encoding); err != nil {
+	if opts.Encodings, err = convert.ParseEncodingSpec(*encoding); err != nil {
 		return usageErr(err)
 	}
 
@@ -286,7 +286,7 @@ func run() int {
 	}
 
 	if *inspect {
-		return runInspect(inputPath, &opts)
+		return runInspect(ctx, inputPath, &opts)
 	}
 	if batch {
 		return runBatch(ctx, fs.Args(), &opts, *outDir, *fileWorkers, *recursive, *logPath, logf)
@@ -355,8 +355,8 @@ func runBatch(ctx context.Context, paths []string, opts *convert.Options,
 // runInspect reads the header and symbol tables only, then prints the schema a
 // conversion would produce. The report is the command's result, so it goes to
 // stdout; diagnostics stay on stderr.
-func runInspect(inputPath string, opts *convert.Options) int {
-	rep, err := convert.Inspect(inputPath, opts)
+func runInspect(ctx context.Context, inputPath string, opts *convert.Options) int {
+	rep, err := convert.Inspect(ctx, inputPath, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
 		return exitCodeFor(err)
@@ -372,7 +372,7 @@ func runInspect(inputPath string, opts *convert.Options) int {
 			fmt.Fprintf(os.Stderr, "%s: no schema to report: %v\n", programName, rep.SchemaErr)
 			return exitSchema
 		}
-		if err := convert.WriteSchemaReport(opts.SchemaReportPath, inputPath, rep.File, rep.Schema, opts); err != nil {
+		if err := convert.WriteSchemaReport(opts.SchemaReportPath, inputPath, rep.File, rep.Schema, opts, rep.Encodings); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
 			return exitOutput
 		}

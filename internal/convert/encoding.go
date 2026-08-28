@@ -20,30 +20,48 @@ type EncodingRule struct {
 	Encoding parquetwrite.Encoding
 }
 
-// ParseEncodingRules reads the --encoding value: a comma-separated list of
-// PATTERN=ENCODING.
-func ParseEncodingRules(spec string) ([]EncodingRule, error) {
+// EncodingSpec is the parsed --encoding value: explicit rules, and whether to
+// measure. The two compose, and an explicit rule wins over a measurement, so
+// "auto,%*_PKEY=plain" measures every candidate column except that one.
+type EncodingSpec struct {
+	// Auto asks for the encoding to be measured per file rather than named.
+	// A pattern cannot know what a table's key looks like, and over a folder
+	// of tables it is the only form that can answer per file.
+	Auto  bool
+	Rules []EncodingRule
+}
+
+// AutoKeyword requests the measurement instead of naming an encoding.
+const AutoKeyword = "auto"
+
+// ParseEncodingSpec reads the --encoding value: a comma-separated list of
+// PATTERN=ENCODING, the word "auto", or both.
+func ParseEncodingSpec(spec string) (EncodingSpec, error) {
+	var out EncodingSpec
 	if strings.TrimSpace(spec) == "" {
-		return nil, nil
+		return out, nil
 	}
-	var rules []EncodingRule
 	for _, part := range strings.Split(spec, ",") {
 		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(part), AutoKeyword) {
+			out.Auto = true
 			continue
 		}
 		pattern, name, ok := strings.Cut(part, "=")
 		pattern = strings.TrimSpace(pattern)
 		if !ok || pattern == "" {
-			return nil, fmt.Errorf("invalid --encoding %q: want PATTERN=ENCODING, "+
-				"for example '%%*_PKEY=delta_byte_array'", part)
+			return EncodingSpec{}, fmt.Errorf("invalid --encoding %q: want PATTERN=ENCODING "+
+				"or %s, for example '%%*_PKEY=delta_byte_array'", part, AutoKeyword)
 		}
 		enc, err := parquetwrite.ParseEncoding(name)
 		if err != nil {
-			return nil, fmt.Errorf("invalid --encoding %q: %w", part, err)
+			return EncodingSpec{}, fmt.Errorf("invalid --encoding %q: %w", part, err)
 		}
-		rules = append(rules, EncodingRule{Pattern: pattern, Encoding: enc})
+		out.Rules = append(out.Rules, EncodingRule{Pattern: pattern, Encoding: enc})
 	}
-	return rules, nil
+	return out, nil
 }
 
 // ResolvedEncodings is the outcome of applying the rules to a resolved schema.
@@ -51,12 +69,44 @@ type ResolvedEncodings struct {
 	// ByColumn maps output column name to the encoding it is pinned to.
 	ByColumn map[string]parquetwrite.Encoding
 	// Pinned describes each pinned column as "NAME=encoding", in schema
-	// order, for a log line.
-	Pinned []string
+	// order, for a log line. The first Explicit of them come from rules; any
+	// after that were adopted from a measurement.
+	Pinned   []string
+	Explicit int
+	// Trials holds every measurement taken, adopted or not, so a report can
+	// show the evidence and not only the decision.
+	Trials []EncodingTrial
 	// Unmatched holds patterns that reached no column. As with --exclude a
 	// pattern matching nothing is reported rather than rejected, since one
 	// command line covers a folder of tables with differing fields.
 	Unmatched []string
+}
+
+// Adopted reports whether a trial's encoding is what the column will be
+// written with, which is what separates a measurement acted on from one that
+// was only taken.
+func (r *ResolvedEncodings) Adopted(t EncodingTrial) bool {
+	return r != nil && r.ByColumn[t.Column] == t.Encoding
+}
+
+// AdoptTrials takes on the measurements worth acting on. A column an explicit
+// rule already names is left alone, which the trial itself also enforces by
+// not measuring such a column at all.
+func (r *ResolvedEncodings) AdoptTrials(trials []EncodingTrial) (adopted, rejected int) {
+	r.Trials = trials
+	for _, t := range trials {
+		if _, pinned := r.ByColumn[t.Column]; pinned {
+			continue
+		}
+		if !t.Worthwhile() {
+			rejected++
+			continue
+		}
+		r.ByColumn[t.Column] = t.Encoding
+		r.Pinned = append(r.Pinned, fmt.Sprintf("%s=%s", t.Column, t.Encoding))
+		adopted++
+	}
+	return adopted, rejected
 }
 
 // ResolveEncodings applies the rules to the schema. A later rule wins over an
@@ -89,6 +139,7 @@ func ResolveEncodings(rules []EncodingRule, rs *ResolvedSchema, f *qvd.File) (*R
 			out.Pinned = append(out.Pinned, fmt.Sprintf("%s=%s", rs.Columns[i].Name, enc))
 		}
 	}
+	out.Explicit = len(out.Pinned)
 	for ri, r := range rules {
 		if !used[ri] {
 			out.Unmatched = append(out.Unmatched, r.Pattern)

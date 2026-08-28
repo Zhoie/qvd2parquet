@@ -112,6 +112,7 @@ qvd2parquet --inspect [options] input.qvd
   -recursive                 With --out-dir, descend into subdirectories
   -include-files 'CE*'       With --out-dir, convert only files matching these patterns
   -exclude-files '*_TMP'     With --out-dir, skip files matching these patterns
+  -skip-up-to-date           With --out-dir, leave a file this run already produced
   -log path.jsonl            Write one JSON Lines record per input, then a summary
   -columns name1,name2       Convert only these columns
   -exclude '%*,*_TMP'        Skip fields matching these wildcard patterns
@@ -360,6 +361,108 @@ qvd2parquet: --include-files/--exclude-files "ZZ*" left none of the 3 .qvd file(
 
 On Windows a pattern starting with `%` runs into
 [the `cmd.exe` expansion](#percent-signs-on-windows) covered above.
+
+### Converting only what changed
+
+Over a folder re-extracted nightly, most inputs have not changed since the last
+run. `--skip-up-to-date` leaves those alone:
+
+```sh
+qvd2parquet --out-dir ./parquet --force --skip-up-to-date ./qvds
+```
+
+```text
+qvd2parquet: skip qvds/A057.qvd (up to date)
+qvd2parquet: skip qvds/BSEG.qvd (up to date)
+qvd2parquet: ok   qvds/CE10500.qvd -> parquet/CE10500.parquet (20,589,661 rows, 213 columns, 1.8 GiB)
+converted 1/3 file(s) in 14m22s: 20,589,661 rows, 1.8 GiB; 2 skipped
+```
+
+**It is not a timestamp comparison.** "Is the `.parquet` newer than the `.qvd`"
+answers the wrong question, in three ways that all end in a stale output nobody
+is told about:
+
+- It cannot see that the **conversion options changed**. A run with a different
+  `--decimal-source` or `--encoding` would skip a file it has never converted
+  that way.
+- A re-extracted QVD **copied with its timestamps preserved** (`rsync -t`,
+  `robocopy /copy:t`) arrives looking older than the output it should replace.
+- Two clocks on a network share need not agree.
+
+So the run keeps a record instead, in `.qvd2parquet-manifest.json` under
+`--out-dir`, and a file is skipped only when **this exact run already produced
+it**. All five have to hold:
+
+| | |
+|---|---|
+| the manifest names the output | it was this tool that wrote it |
+| the entry names this input | two folders can each hold an `A.qvd`, and both produce `A.parquet` |
+| the input's size and timestamp match | the source has not been re-extracted |
+| the options fingerprint matches | the run would write the same thing |
+| the output's size and timestamp match | nothing has replaced it since |
+
+The input is identified by its resolved absolute path, so running the same job
+from a different working directory or through a symlinked parent changes
+nothing. Genuinely moving the folder reconverts it once.
+
+The fingerprint covers every option that can change what is written, including
+the **contents** of a `--schema` override rather than only its path, the
+**transitions** of `--timezone` rather than its name, and the tool's major
+version.
+
+The timezone is fingerprinted by what it does, because a name is not identity
+there: `time.Local` reports an IANA name only when `TZ` is set, and with `TZ`
+unset, which is how a server usually takes its zone from `/etc/localtime`, it
+is the bare word `Local` whether the machine sits in Berlin or Tokyo. Since
+`--timezone Local` writes timestamps against the converting machine's zone, a
+manifest that recorded only the word would be trusted by a machine that would
+now write different ones.
+
+Sampling instants cannot answer it, however many are taken: `America/Boise` and
+`America/Denver` agree on the first of January and the first of July in every
+year from 1970 to 2050, and disagree through most of January 1974, when Denver
+took up the emergency daylight saving three weeks before Boise did. Narrowing
+to recent years cannot answer it either: `Africa/Abidjan` and `GMT` agree from
+1970 onwards and differ by sixteen minutes of local mean time in 1900, and a
+QVD reaches 1900 easily, its own serial epoch being 1899-12-30.
+
+So the fingerprint walks every transition over the whole range a conversion
+accepts, with nothing in between and nothing outside. It costs almost nothing:
+the zone table stops at its last real transition rather than projecting a rule
+forward for ever, so a busy zone is under two hundred steps and UTC is one. A
+`tzdata` update that moves a transition reconverts the folder, which is right
+rather than wasteful; the default `--timezone none` computes in UTC, which has
+no transitions at all. Options that cannot change the output are left out, so a
+folder does not reconvert itself over a different `--workers` or `--progress`.
+[The stability promise](CHANGELOG.md) is what makes the major version enough: a
+default does not change what an existing file converts to outside a major bump,
+so `2.2.0` to `2.3.0` keeps the manifest and `3.0.0` retires it.
+
+`--skip-up-to-date` and `--force` are **different questions**, which is what
+keeps a rerun a one-flag change:
+
+- `--force` is write permission: may an existing output be overwritten. Any
+  repeat run needs it, with or without this feature.
+- `--skip-up-to-date` is selection: which files to attempt at all.
+
+A nightly job passes both. **Dropping `--skip-up-to-date` reruns the whole
+folder**, and so does deleting the manifest. Nothing is ever skipped by
+default.
+
+Worth knowing:
+
+- The manifest is written **only** when the flag is passed, so a run that never
+  asks for this leaves no state behind.
+- It is a dotfile, which the Parquet readers that scan a directory ignore
+  along with any other name beginning with a dot or an underscore.
+- A file that **failed** is not recorded, and is attempted again next time. The
+  writer renames a temporary into place, so a failed conversion cannot have
+  replaced the output the manifest describes.
+- A manifest that is missing, corrupt or from a newer format converts the
+  folder again rather than failing the run. The worst a lost manifest can do is
+  repeat work.
+- A skipped file is still a record in `--log`, with `"status": "skipped"`, so a
+  run's log accounts for every input it was given.
 
 ### Parallelism
 
